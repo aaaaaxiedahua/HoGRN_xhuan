@@ -1,0 +1,18 @@
+{
+  "_entry": "restore.py",
+  "data": "FB15K-237-10",
+  "restore": true,
+  "name": "fb10_transe",
+  "rel_reason": true,
+  "batch": 128,
+  "init_dim": 100,
+  "gcn_dim": 100,
+  "embed_dim": 100,
+  "gcn_layer": 2,
+  "gcn_drop": 0.1,
+  "score_func": "transe",
+  "chan_drop": 0.1,
+  "rel_norm": true,
+  "hid_drop": 0.2,
+  "sim_decay": 1e-06
+}

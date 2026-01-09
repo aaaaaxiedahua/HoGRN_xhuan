@@ -1,0 +1,16 @@
+{
+  "_entry": "run.py",
+  "data": "WD-singer",
+  "rel_reason": true,
+  "batch": 256,
+  "init_dim": 150,
+  "gcn_dim": 150,
+  "embed_dim": 150,
+  "gcn_layer": 2,
+  "gcn_drop": 0.0,
+  "score_func": "distmult",
+  "chan_drop": 0.1,
+  "rel_mask": 0.0,
+  "rel_norm": true,
+  "hid_drop": 0.2
+}

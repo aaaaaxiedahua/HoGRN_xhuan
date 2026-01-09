@@ -1,0 +1,18 @@
+{
+  "_entry": "restore.py",
+  "data": "NELL23K",
+  "restore": true,
+  "name": "nell23k_transe",
+  "rel_reason": true,
+  "batch": 128,
+  "init_dim": 100,
+  "gcn_dim": 100,
+  "embed_dim": 100,
+  "gcn_layer": 1,
+  "gcn_drop": 0.2,
+  "score_func": "transe",
+  "chan_drop": 0.1,
+  "rel_norm": true,
+  "hid_drop": 0.2,
+  "sim_decay": 1e-05
+}

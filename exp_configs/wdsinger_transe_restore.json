@@ -1,0 +1,18 @@
+{
+  "_entry": "restore.py",
+  "data": "WD-singer",
+  "restore": true,
+  "name": "wdsinger_transe",
+  "rel_reason": true,
+  "batch": 128,
+  "init_dim": 100,
+  "gcn_dim": 100,
+  "embed_dim": 100,
+  "gcn_layer": 2,
+  "gcn_drop": 0.3,
+  "score_func": "transe",
+  "chan_drop": 0.3,
+  "rel_mask": 0.1,
+  "rel_norm": true,
+  "hid_drop": 0.1
+}

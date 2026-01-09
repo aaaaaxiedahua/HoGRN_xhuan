@@ -1,0 +1,19 @@
+{
+  "_entry": "restore.py",
+  "data": "FB15K-237-10",
+  "restore": true,
+  "name": "fb10_conve",
+  "rel_reason": true,
+  "batch": 128,
+  "init_dim": 100,
+  "gcn_dim": 100,
+  "embed_dim": 100,
+  "gcn_layer": 2,
+  "gcn_drop": 0.1,
+  "score_func": "conve",
+  "chan_drop": 0.2,
+  "rel_mask": 0.2,
+  "rel_norm": true,
+  "hid_drop": 0.3,
+  "sim_decay": 1e-05
+}
