@@ -94,6 +94,17 @@ class Runner(object):
 		self.edge_index, self.edge_type = self.construct_adj()
 		self.rel_edge_index, self.rel_edge_weight = None, None
 		if getattr(self.p, 'dual_rel', False):
+			t_rel = time.time()
+			self.logger.info('DualRel: Building static relation graph (walk={}, weight={}, hops={}, topk={}, min_count={}, sym={}, alpha={}, drop={})'.format(
+				getattr(self.p, 'dual_walk', 'path'),
+				getattr(self.p, 'dual_weight', 'ppmi'),
+				getattr(self.p, 'dual_hops', 2),
+				getattr(self.p, 'dual_topk', 20),
+				getattr(self.p, 'dual_min_count', 1),
+				getattr(self.p, 'dual_sym', True),
+				getattr(self.p, 'dual_alpha', 0.1),
+				getattr(self.p, 'dual_drop', 0.0),
+			))
 			self.rel_edge_index, self.rel_edge_weight = build_static_relation_graph(
 				self.edge_index,
 				self.edge_type,
@@ -108,6 +119,21 @@ class Runner(object):
 			)
 			self.rel_edge_index = self.rel_edge_index.to(self.device)
 			self.rel_edge_weight = self.rel_edge_weight.to(self.device)
+
+			num_rel_nodes = self.p.num_rel * 2
+			num_rel_edges = int(self.rel_edge_index.size(1))
+			avg_deg = float(num_rel_edges) / float(max(1, num_rel_nodes))
+			if num_rel_edges > 0:
+				w_cpu = self.rel_edge_weight.detach().float().cpu()
+				w_min = float(w_cpu.min().item())
+				w_max = float(w_cpu.max().item())
+				w_mean = float(w_cpu.mean().item())
+				w_std = float(w_cpu.std(unbiased=False).item())
+			else:
+				w_min, w_max, w_mean, w_std = 0.0, 0.0, 0.0, 0.0
+			self.logger.info('DualRel: Relation graph ready: nodes={}, edges={}, avg_deg={:.3f}, w[min/mean/std/max]={:.4f}/{:.4f}/{:.4f}/{:.4f}, build_time={:.3f}s'.format(
+				num_rel_nodes, num_rel_edges, avg_deg, w_min, w_mean, w_std, w_max, time.time() - t_rel
+			))
 
 	def construct_adj(self):
 		"""
