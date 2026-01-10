@@ -356,6 +356,7 @@ if __name__ == '__main__':
 	parser.add_argument('-disen_k',		dest='disen_k',		default=1,		type=int,	help='Number of disentangled semantic channels (K). Use 1 to disable.')
 	parser.add_argument('-disen_gate',	dest='disen_gate',	default='rel',	type=str,	help='Gating type for channel fusion: rel|uniform')
 	parser.add_argument('-disen_indep',	dest='disen_indep',	default=0,		type=float,	help='Weight for channel independence regularization')
+	parser.add_argument('-disen_conve',	dest='disen_conve',	default='b',	type=str,	help='Disentangled ConvE strategy when disen_k>1: a (gate+flatten) | b (per-channel ConvE + gate)')
 	parser.add_argument('-transe_chunk', dest='transe_chunk', default=0,		type=int,	help='Chunk size for TransE scoring over entities (0=auto)')
 
 	# ConvE specific hyperparameters

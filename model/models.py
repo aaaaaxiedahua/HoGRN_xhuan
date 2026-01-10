@@ -227,25 +227,51 @@ class HoGRN_ConvE(HoGRNBase):
 	def __init__(self, edge_index, edge_type, params=None):
 		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
 
+		self.disen_conve = str(getattr(self.p, 'disen_conve', 'b')).lower()
+		if self.disen_conve not in {'a', 'b'}:
+			raise ValueError('disen_conve must be a or b')
+
+		# Scheme A uses the vanilla ConvE architecture (embed_dim = k_w*k_h).
+		# Scheme B uses a per-channel ConvE expert (embed_dim_k = k_w_k*k_h_k) and fuses scores by gating.
+		if self.disen_k > 1 and self.disen_conve == 'b':
+			self.conve_dim = self.embed_dim_k
+			self.k_w_eff, self.k_h_eff = self._factorize_dim(self.conve_dim)
+		else:
+			self.conve_dim = self.p.embed_dim
+			self.k_w_eff, self.k_h_eff = self.p.k_w, self.p.k_h
+
 		self.bn0	= torch.nn.BatchNorm2d(1)
 		self.bn1	= torch.nn.BatchNorm2d(self.p.num_filt)
-		self.bn2	= torch.nn.BatchNorm1d(self.p.embed_dim)
+		self.bn2	= torch.nn.BatchNorm1d(self.conve_dim)
 		
 		self.hidden_drop	= torch.nn.Dropout(self.p.hid_drop)
 		self.hidden_drop2	= torch.nn.Dropout(self.p.hid_drop2)
 		self.feature_drop	= torch.nn.Dropout(self.p.feat_drop)
 		self.m_conv1		= torch.nn.Conv2d(1, out_channels=self.p.num_filt, kernel_size=(self.p.ker_sz, self.p.ker_sz), stride=1, padding=0, bias=self.p.bias)
 
-		flat_sz_h		= int(2*self.p.k_w) - self.p.ker_sz + 1
-		flat_sz_w		= self.p.k_h 	    - self.p.ker_sz + 1
+		flat_sz_h		= int(2*self.k_w_eff) - self.p.ker_sz + 1
+		flat_sz_w		= self.k_h_eff 	    - self.p.ker_sz + 1
+		if flat_sz_h <= 0 or flat_sz_w <= 0:
+			raise ValueError('Invalid ConvE shape: k_w={}, k_h={}, ker_sz={}'.format(self.k_w_eff, self.k_h_eff, self.p.ker_sz))
 		self.flat_sz	= flat_sz_h*flat_sz_w*self.p.num_filt
-		self.fc			= torch.nn.Linear(self.flat_sz, self.p.embed_dim)
+		self.fc			= torch.nn.Linear(self.flat_sz, self.conve_dim)
+
+	@staticmethod
+	def _factorize_dim(dim):
+		dim = int(dim)
+		best = (dim, 1)
+		for a in range(1, int(dim ** 0.5) + 1):
+			if dim % a == 0:
+				b = dim // a
+				if abs(b - a) < abs(best[0] - best[1]):
+					best = (b, a)
+		return best[0], best[1]  # k_w >= k_h
 
 	def concat(self, e1_embed, rel_embed):
-		e1_embed	= e1_embed. view(-1, 1, self.p.embed_dim)
-		rel_embed	= rel_embed.view(-1, 1, self.p.embed_dim)
+		e1_embed	= e1_embed. view(-1, 1, self.conve_dim)
+		rel_embed	= rel_embed.view(-1, 1, self.conve_dim)
 		stack_inp	= torch.cat([e1_embed, rel_embed], 1)
-		stack_inp	= torch.transpose(stack_inp, 2, 1).reshape((-1, 1, 2*self.p.k_w, self.p.k_h))
+		stack_inp	= torch.transpose(stack_inp, 2, 1).reshape((-1, 1, 2*self.k_w_eff, self.k_h_eff))
 		return stack_inp
 
 	def forward(self, sub, rel):
@@ -262,11 +288,36 @@ class HoGRN_ConvE(HoGRNBase):
 		# Scheme A for disentanglement: gate channels, then flatten back to embed_dim and reuse vanilla ConvE.
 		if self.disen_k == 1:
 			sub_flat, rel_flat, all_ent_flat = sub_emb, rel_emb, all_ent
-		else:
+		elif self.disen_conve == 'a':
 			alpha = self._get_channel_alpha(rel_emb)  # (B, K)
 			sub_flat = (sub_emb * alpha.unsqueeze(-1)).reshape(sub_emb.size(0), -1)
 			rel_flat = (rel_emb * alpha.unsqueeze(-1)).reshape(rel_emb.size(0), -1)
 			all_ent_flat = all_ent.reshape(all_ent.size(0), -1)
+		else:
+			# Scheme B: per-channel ConvE experts and gated fusion on scores.
+			alpha = self._get_channel_alpha(rel_emb)  # (B, K)
+			score_sum = sub_emb.new_zeros((sub_emb.size(0), all_ent.size(0)))
+			for k in range(self.disen_k):
+				sub_k = sub_emb[:, k, :]
+				rel_k = rel_emb[:, k, :]
+				ent_k = all_ent[:, k, :]
+
+				stk_inp	= self.concat(sub_k, rel_k)
+				x		= self.bn0(stk_inp)
+				x		= self.m_conv1(x)
+				x		= self.bn1(x)
+				x		= F.relu(x)
+				x		= self.feature_drop(x)
+				x		= x.view(-1, self.flat_sz)
+				x		= self.fc(x)
+				x		= self.hidden_drop2(x)
+				x		= self.bn2(x)
+				x		= F.relu(x)
+
+				score_sum = score_sum + alpha[:, k].unsqueeze(1) * torch.mm(x, ent_k.transpose(1, 0))
+
+			score_sum = score_sum + self.bias.expand_as(score_sum)
+			return torch.sigmoid(score_sum), reg
 
 		stk_inp	= self.concat(sub_flat, rel_flat)
 		x		= self.bn0(stk_inp)

@@ -17,5 +17,6 @@
   "disen_k": 4,
   "disen_gate": "rel",
   "disen_indep": 0.001,
+  "disen_conve": "b",
   "transe_chunk": 0
 }
