@@ -45,8 +45,8 @@ class MessagePassing(torch.nn.Module):
 	def __init__(self, aggr='add'):
 		super(MessagePassing, self).__init__()
 
-		self.message_args = inspect.getargspec(self.message)[0][1:]	# In the defined message function: get the list of arguments as list of string| For eg. in rgcn this will be ['x_j', 'edge_type', 'edge_norm'] (arguments of message function)
-		self.update_args  = inspect.getargspec(self.update)[0][2:]	# Same for update function starting from 3rd argument | first=self, second=out
+		self.message_args = list(inspect.signature(self.message).parameters.keys())[1:]	# Skip self
+		self.update_args  = list(inspect.signature(self.update).parameters.keys())[2:]	# Skip self, aggr_out
 
 	def propagate(self, aggr, edge_index, **kwargs):
 		r"""The initial call to start propagating messages.

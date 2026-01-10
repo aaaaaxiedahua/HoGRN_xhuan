@@ -14,9 +14,13 @@ class HoGRNConv(MessagePassing):
 		self.num_rels 		= num_rels
 		self.act 		= act
 		self.device		= None
+		self.disen_k	= int(getattr(self.p, 'disen_k', 1))
 		self.softmax 	= torch.nn.Softmax(dim=-1)
 
-		self.loop_rel 	= get_param((1, in_channels))
+		if self.disen_k == 1:
+			self.loop_rel = get_param((1, in_channels))
+		else:
+			self.loop_rel = get_param((1, self.disen_k, in_channels))
 
 		self.drop		= torch.nn.Dropout(self.p.dropout)
 		self.bn			= torch.nn.BatchNorm1d(out_channels)
@@ -37,6 +41,26 @@ class HoGRNConv(MessagePassing):
 				self.MixerBlock_1 = MixerDrop(self.num_rels*2+1, out_channels, self.p.relmix_dim, self.p.chamix_dim, self.p.rel_mask, self.p.chan_drop)
 				self.MixerBlock_2 = MixerDrop(self.num_rels*2+1, out_channels, self.p.relmix_dim, self.p.chamix_dim, self.p.rel_mask, self.p.chan_drop)
 				self.MixerBlock_3 = MixerDrop(self.num_rels*2+1, out_channels, self.p.relmix_dim, self.p.chamix_dim, self.p.rel_mask, self.p.chan_drop)
+
+	def _apply_bn(self, out):
+		if out.dim() == 2:
+			return self.bn(out)
+		if out.dim() == 3:
+			n, k, c = out.size()
+			out = out.contiguous().view(n * k, c)
+			out = self.bn(out)
+			return out.view(n, k, c)
+		raise ValueError('Unexpected out dim: {}'.format(out.dim()))
+
+	def _apply_mixer(self, mixer, rel_embed):
+		if rel_embed.dim() == 2:
+			return mixer(rel_embed, training=self.training)
+		if rel_embed.dim() == 3:
+			outs = []
+			for k in range(rel_embed.size(1)):
+				outs.append(mixer(rel_embed[:, k, :], training=self.training))
+			return torch.stack(outs, dim=1)
+		raise ValueError('Unexpected rel_embed dim: {}'.format(rel_embed.dim()))
 
 	def forward(self, x, edge_index, edge_type, rel_embed): 
 		if self.device is None:
@@ -71,14 +95,18 @@ class HoGRNConv(MessagePassing):
 			out_res		= self.propagate('add', self.out_index,  x=x, edge_type=self.out_type,  rel_embed=rel_embed, edge_norm=None)
 			out			= self.drop(in_res)*(1/2) + self.drop(out_res)*(1/2) 
 
-		if self.p.bias: out = out + self.bias
+		if self.p.bias:
+			if out.dim() == 2:
+				out = out + self.bias
+			else:
+				out = out + self.bias.view(1, 1, -1)
 
 		if self.p.rel_reason and not self.p.pre_reason:
 			rel_embed = self.rel_reason(rel_embed)
 			if self.p.rel_norm:
 				rel_embed = self.rel_norm(rel_embed)
 		
-		return self.bn(out), rel_embed[:-1]
+		return self._apply_bn(out), rel_embed[:-1]
 
 	def rel_transform(self, ent_embed, rel_embed):
 		if   self.p.opn == 'corr': 	trans_embed  = ccorr(ent_embed, rel_embed)
@@ -94,14 +122,14 @@ class HoGRNConv(MessagePassing):
 		elif self.p.reason_type == 'mlp':
 			return torch.matmul(rel_embed, self.w_rel)
 		elif self.p.reason_type == 'mixdrop':
-			return self.MixerBlock(rel_embed, training=self.training)
+			return self._apply_mixer(self.MixerBlock, rel_embed)
 		elif self.p.reason_type == 'mixdrop2':
-			rel_embed = self.MixerBlock_1(rel_embed, training=self.training)
-			return self.MixerBlock_2(rel_embed, training=self.training)
+			rel_embed = self._apply_mixer(self.MixerBlock_1, rel_embed)
+			return self._apply_mixer(self.MixerBlock_2, rel_embed)
 		elif self.p.reason_type == 'mixdrop3':
-			rel_embed = self.MixerBlock_1(rel_embed, training=self.training)
-			rel_embed = self.MixerBlock_2(rel_embed, training=self.training)
-			return self.MixerBlock_3(rel_embed, training=self.training)
+			rel_embed = self._apply_mixer(self.MixerBlock_1, rel_embed)
+			rel_embed = self._apply_mixer(self.MixerBlock_2, rel_embed)
+			return self._apply_mixer(self.MixerBlock_3, rel_embed)
 
 	def message(self, x_i, x_j, edge_type, rel_embed, edge_norm):
 		rel_emb		= torch.index_select(rel_embed, 0, edge_type)
@@ -113,7 +141,11 @@ class HoGRNConv(MessagePassing):
 			alpha 		= (xi_rel * xj_rel).sum(dim=-1, keepdim=True) 
 			aggr_coef	= self.softmax_sp(alpha, self.in_index[0], self.num_ent) 
 		out			= aggr_coef * xj_rel
-		return out if edge_norm is None else out * edge_norm.view(-1, 1)
+		if edge_norm is None:
+			return out
+		if out.dim() == 2:
+			return out * edge_norm.view(-1, 1)
+		return out * edge_norm.view(-1, 1, 1)
 
 	def update(self, aggr_out):
 		return aggr_out

@@ -12,5 +12,9 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "hid_drop": 0.2,
-  "sim_decay": 1e-05
+  "sim_decay": 1e-05,
+  "disen_k": 4,
+  "disen_gate": "rel",
+  "disen_indep": 0.0005,
+  "transe_chunk": 4096
 }

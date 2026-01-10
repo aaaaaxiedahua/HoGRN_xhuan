@@ -264,11 +264,9 @@ class Runner(object):
 			self.optimizer.zero_grad()
 			sub, rel, obj, label = self.read_batch(batch, 'train')
 
-			pred, cor	= self.model.forward(sub, rel)
+			pred, reg	= self.model.forward(sub, rel)
 			loss	= self.model.loss(pred, label)
-
-			if self.p.sim_decay > 0:
-				loss += self.p.sim_decay * cor
+			loss	= loss + reg
 
 			loss.backward()
 			self.optimizer.step()
@@ -370,6 +368,12 @@ if __name__ == '__main__':
 	parser.add_argument('-temperature', dest='temperature', default=1,  	type=float,	help='temperature coefficient')
 	parser.add_argument('-sim_decay',	dest='sim_decay',	default=0,		type=float, help='Regularization weight for independence modeling')
 	parser.add_argument('-rel_drop',  	dest='rel_drop', 	default=0,  	type=float,	help='Dropout for generate positive relation')
+
+	# Disentangled-HoGRN (scheme 2)
+	parser.add_argument('-disen_k',		dest='disen_k',		default=1,		type=int,	help='Number of disentangled semantic channels (K). Use 1 to disable.')
+	parser.add_argument('-disen_gate',	dest='disen_gate',	default='rel',	type=str,	help='Gating type for channel fusion: rel|uniform')
+	parser.add_argument('-disen_indep',	dest='disen_indep',	default=0,		type=float,	help='Weight for channel independence regularization')
+	parser.add_argument('-transe_chunk', dest='transe_chunk', default=0,		type=int,	help='Chunk size for TransE scoring over entities (0=auto)')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')
