@@ -2,6 +2,37 @@ from helper import *
 from data_loader import *
 from model.models import *
 from dual_graph import build_static_relation_graph
+import json
+from pathlib import Path
+
+
+def _apply_json_config(parser, cfg, config_path):
+	if not isinstance(cfg, dict):
+		raise ValueError(f'Config must be a JSON object: {config_path}')
+
+	known_dests = {a.dest for a in parser._actions}
+	key_to_dest = {}
+	for action in parser._actions:
+		for opt in action.option_strings:
+			if opt.startswith('-'):
+				key_to_dest[opt.lstrip('-')] = action.dest
+
+	overrides = {}
+	unknown_keys = []
+	for key, value in cfg.items():
+		if key == '_entry':
+			continue
+		dest = key_to_dest.get(key)
+		if dest is None and key in known_dests:
+			dest = key
+		if dest is None:
+			unknown_keys.append(key)
+			continue
+		overrides[dest] = value
+
+	if unknown_keys:
+		print(f'[config] Warning: unknown keys ignored in {config_path}: {sorted(unknown_keys)}')
+	parser.set_defaults(**overrides)
 
 class Runner(object):
 
@@ -313,6 +344,7 @@ class Runner(object):
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parser For Arguments', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+	parser.add_argument('--config',	dest='config_path',	default=None, help='Path to a JSON experiment config (exp_configs/*.json).')
 
 	parser.add_argument('-name',		dest='name',		default='testrun',		help='Set run name for saving/restoring models')
 	parser.add_argument('-data',		dest='dataset',		default='FB15K-237-10',	help='Dataset to use.')
@@ -379,6 +411,17 @@ if __name__ == '__main__':
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
+
+	pre_args, _ = parser.parse_known_args()
+	if pre_args.config_path:
+		config_path = Path(pre_args.config_path)
+		cfg = json.loads(config_path.read_text(encoding='utf-8'))
+		entry = cfg.get('_entry')
+		if entry and entry != 'restore.py':
+			print(f'[config] Warning: config _entry={entry!r} but running restore.py')
+		_apply_json_config(parser, cfg, str(config_path))
+		print(f'[config] Loaded: {config_path}')
+
 	args = parser.parse_args()
 
 	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
