@@ -1,4 +1,4 @@
-import numpy as np, sys, os, random, pdb, json, uuid, time, argparse
+import numpy as np, sys, os, random, pdb, json, uuid, time, argparse, re
 from pprint import pprint
 import logging, logging.config
 from collections import defaultdict as ddict
@@ -14,6 +14,19 @@ from torch_scatter import scatter_add
 
 np.set_printoptions(precision=4)
 
+def sanitize_run_name(name: str) -> str:
+	"""
+	Make a string safe to use as a filename on Windows/macOS/Linux.
+	"""
+	if name is None:
+		return ''
+	name = str(name)
+	# Windows forbids: < > : " / \ | ? *
+	name = re.sub(r'[<>:"/\\\\|?*]+', '-', name)
+	# Avoid trailing spaces/dots on Windows.
+	name = name.rstrip(' .')
+	return name
+
 def set_gpu(gpus):
 	"""
 	Sets the GPU to be used for the run
@@ -26,7 +39,8 @@ def get_logger(name, log_dir, config_dir):
 	Creates a logger object
 	"""
 	config_dict = json.load(open( config_dir + 'log_config.json'))
-	config_dict['handlers']['file_handler']['filename'] = log_dir + name.replace('/', '-')
+	safe_name = sanitize_run_name(name).replace('/', '-')
+	config_dict['handlers']['file_handler']['filename'] = log_dir + safe_name
 	logging.config.dictConfig(config_dict)
 	logger = logging.getLogger(name)
 

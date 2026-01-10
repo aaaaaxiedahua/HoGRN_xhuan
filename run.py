@@ -430,7 +430,8 @@ if __name__ == '__main__':
 
 	args = parser.parse_args()
 
-	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
+	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H-%M-%S')
+	args.name = sanitize_run_name(args.name)
 
 	# set_gpu(args.gpu)
 	np.random.seed(args.seed)
