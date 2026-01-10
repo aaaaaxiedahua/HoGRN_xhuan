@@ -45,8 +45,17 @@ class MessagePassing(torch.nn.Module):
 	def __init__(self, aggr='add'):
 		super(MessagePassing, self).__init__()
 
-		self.message_args = list(inspect.signature(self.message).parameters.keys())[1:]	# Skip self
-		self.update_args  = list(inspect.signature(self.update).parameters.keys())[2:]	# Skip self, aggr_out
+		def _param_names(fn):
+			names = list(inspect.signature(fn).parameters.keys())
+			if names and names[0] == 'self':
+				names = names[1:]
+			return names
+
+		self.message_args = _param_names(self.message)
+		update_names = _param_names(self.update)
+		if update_names and update_names[0] in ('aggr_out', 'out'):
+			update_names = update_names[1:]
+		self.update_args = update_names
 
 	def propagate(self, aggr, edge_index, **kwargs):
 		r"""The initial call to start propagating messages.
