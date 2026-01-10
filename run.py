@@ -2,6 +2,42 @@ from helper import *
 from data_loader import *
 from model.models import *
 
+def _apply_json_config(parser, config_path):
+	"""
+	Load a JSON experiment config and apply its values as parser defaults.
+	Config keys should match option names without leading dashes (e.g., 'data', 'batch', 'score_func').
+	"""
+	if not config_path:
+		return
+	with open(config_path, 'r', encoding='utf-8') as f:
+		cfg = json.load(f)
+
+	if isinstance(cfg, dict):
+		cfg.pop('_entry', None)
+
+	actions_by_key = {}
+	for action in parser._actions:
+		for opt in getattr(action, 'option_strings', []):
+			key = opt.lstrip('-')
+			if key:
+				actions_by_key[key] = action
+
+	defaults = {}
+	for key, value in cfg.items():
+		action = actions_by_key.get(key)
+		if action is None:
+			continue
+		if isinstance(action, argparse._StoreTrueAction):
+			defaults[action.dest] = bool(value)
+		elif isinstance(action, argparse._StoreFalseAction):
+			defaults[action.dest] = not bool(value)
+		else:
+			if getattr(action, 'type', None) is str and value is not None and not isinstance(value, str):
+				value = str(value)
+			defaults[action.dest] = value
+
+	parser.set_defaults(**defaults)
+
 class Runner(object):
 
 	def load_data(self):
@@ -326,6 +362,8 @@ class Runner(object):
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parser For Arguments', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+	parser.add_argument('--config',	dest='exp_config',	default=None,	type=str,	help='Path to a JSON experiment config (e.g., exp_configs/nell23k_conve.json)')
+
 	parser.add_argument('-name',		dest='name',		default='testrun',		help='Set run name for saving/restoring models')
 	parser.add_argument('-data',		dest='dataset',		default='FB15K-237-10',	help='Dataset to use.')
 	parser.add_argument('-model',		dest='model',		default='hogrn',		help='Model Name')
@@ -385,6 +423,11 @@ if __name__ == '__main__':
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
+
+	pre_args, _ = parser.parse_known_args()
+	if pre_args.exp_config:
+		_apply_json_config(parser, pre_args.exp_config)
+
 	args = parser.parse_args()
 
 	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
