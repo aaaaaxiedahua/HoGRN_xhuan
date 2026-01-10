@@ -3,6 +3,7 @@ from pprint import pprint
 import logging, logging.config
 from collections import defaultdict as ddict
 from ordered_set import OrderedSet
+import re
 
 # PyTorch related imports
 import torch
@@ -26,7 +27,9 @@ def get_logger(name, log_dir, config_dir):
 	Creates a logger object
 	"""
 	config_dict = json.load(open( config_dir + 'log_config.json'))
-	config_dict['handlers']['file_handler']['filename'] = log_dir + name.replace('/', '-')
+	os.makedirs(log_dir, exist_ok=True)
+	safe_name = re.sub(r'[<>:"/\\\\|?*]', '-', str(name))
+	config_dict['handlers']['file_handler']['filename'] = os.path.join(log_dir, safe_name)
 	logging.config.dictConfig(config_dict)
 	logger = logging.getLogger(name)
 
