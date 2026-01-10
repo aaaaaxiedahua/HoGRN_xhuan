@@ -20,6 +20,7 @@ class HoGRNBase(BaseModel):
 
 		self.edge_index		= edge_index
 		self.edge_type		= edge_type
+		self.num_rel		= num_rel
 		self.p.gcn_dim		= self.p.embed_dim if self.p.gcn_layer == 1 else self.p.gcn_dim
 		self.init_embed		= get_param((self.p.num_ent,   self.p.init_dim))
 		self.device			= self.edge_index.device
@@ -105,25 +106,25 @@ class HoGRNBase(BaseModel):
 		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
 		if self.dual_rel:
 			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
-			r = self._project_transe_rel(r, num_rel)
+			r = self._project_transe_rel(r, self.num_rel)
 			dual_i += 1
 		x	= drop1(x)
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 2 else (x, r)
 		if self.dual_rel and self.p.gcn_layer >= 2:
 			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
-			r = self._project_transe_rel(r, num_rel)
+			r = self._project_transe_rel(r, self.num_rel)
 			dual_i += 1
 		x	= drop2(x) 							if self.p.gcn_layer >= 2 else x
 		x, r	= self.conv3(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 3 else (x, r)
 		if self.dual_rel and self.p.gcn_layer >= 3:
 			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
-			r = self._project_transe_rel(r, num_rel)
+			r = self._project_transe_rel(r, self.num_rel)
 			dual_i += 1
 		x	= drop2(x) 							if self.p.gcn_layer >= 3 else x
 		x, r	= self.conv4(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 4 else (x, r)
 		if self.dual_rel and self.p.gcn_layer >= 4:
 			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
-			r = self._project_transe_rel(r, num_rel)
+			r = self._project_transe_rel(r, self.num_rel)
 			dual_i += 1
 		x	= drop2(x) 							if self.p.gcn_layer >= 4 else x
 
