@@ -1,6 +1,7 @@
 from re import X
 from helper import *
 from model.hogrn_conv import HoGRNConv
+from model.dual_rel import DualRelGCN
 
 class BaseModel(torch.nn.Module):
 	def __init__(self, params):
@@ -14,7 +15,7 @@ class BaseModel(torch.nn.Module):
 		return self.bceloss(pred, true_label)
 		
 class HoGRNBase(BaseModel):
-	def __init__(self, edge_index, edge_type, num_rel, params=None):
+	def __init__(self, edge_index, edge_type, num_rel, rel_edge_index=None, rel_edge_weight=None, params=None):
 		super(HoGRNBase, self).__init__(params)
 
 		self.edge_index		= edge_index
@@ -28,6 +29,27 @@ class HoGRNBase(BaseModel):
 
 		if self.p.rel_drop > 0:
 			self.drop_rel	= torch.nn.Dropout(self.p.rel_drop)
+
+		self.dual_rel = getattr(self.p, 'dual_rel', False)
+		if self.dual_rel:
+			if rel_edge_index is None:
+				rel_edge_index = torch.empty((2, 0), dtype=torch.long)
+			if rel_edge_weight is None:
+				rel_edge_weight = torch.empty((0,), dtype=torch.float)
+
+			self.register_buffer('rel_edge_index', rel_edge_index)
+			self.register_buffer('rel_edge_weight', rel_edge_weight)
+
+			dual_alpha = getattr(self.p, 'dual_alpha', 0.1)
+			dual_drop = getattr(self.p, 'dual_drop', 0.0)
+			self.dual_gcns = torch.nn.ModuleList()
+			self.dual_gcns.append(DualRelGCN(self.p.gcn_dim, alpha=dual_alpha, dropout=dual_drop))
+			if self.p.gcn_layer >= 2:
+				self.dual_gcns.append(DualRelGCN(self.p.embed_dim, alpha=dual_alpha, dropout=dual_drop))
+			if self.p.gcn_layer >= 3:
+				self.dual_gcns.append(DualRelGCN(self.p.embed_dim, alpha=dual_alpha, dropout=dual_drop))
+			if self.p.gcn_layer >= 4:
+				self.dual_gcns.append(DualRelGCN(self.p.embed_dim, alpha=dual_alpha, dropout=dual_drop))
 
 		self.conv1 = HoGRNConv(self.p.init_dim, 	self.p.gcn_dim,      num_rel, act=self.act, params=self.p)
 		self.conv2 = HoGRNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer >= 2 else None
@@ -64,6 +86,14 @@ class HoGRNBase(BaseModel):
 
 		return mi_score
 
+	def _project_transe_rel(self, rel_embed, num_rel):
+		if self.p.score_func != 'transe':
+			return rel_embed
+		if rel_embed.size(0) != 2 * num_rel:
+			return rel_embed
+		fwd = 0.5 * (rel_embed[:num_rel] - rel_embed[num_rel:])
+		return torch.cat([fwd, -fwd], dim=0)
+
 	def forward_base(self, sub, rel, drop1, drop2):
 		if self.p.edge_drop > 0:
 			edge_index, edge_type = self._edge_sampling(self.edge_index, self.edge_type, self.p.edge_drop)
@@ -71,13 +101,30 @@ class HoGRNBase(BaseModel):
 			edge_index, edge_type = self.edge_index, self.edge_type
 
 		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
+		dual_i = 0
 		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
+		if self.dual_rel:
+			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
+			r = self._project_transe_rel(r, num_rel)
+			dual_i += 1
 		x	= drop1(x)
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 2 else (x, r)
+		if self.dual_rel and self.p.gcn_layer >= 2:
+			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
+			r = self._project_transe_rel(r, num_rel)
+			dual_i += 1
 		x	= drop2(x) 							if self.p.gcn_layer >= 2 else x
 		x, r	= self.conv3(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 3 else (x, r)
+		if self.dual_rel and self.p.gcn_layer >= 3:
+			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
+			r = self._project_transe_rel(r, num_rel)
+			dual_i += 1
 		x	= drop2(x) 							if self.p.gcn_layer >= 3 else x
 		x, r	= self.conv4(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 4 else (x, r)
+		if self.dual_rel and self.p.gcn_layer >= 4:
+			r = self.dual_gcns[dual_i](r, self.rel_edge_index, self.rel_edge_weight)
+			r = self._project_transe_rel(r, num_rel)
+			dual_i += 1
 		x	= drop2(x) 							if self.p.gcn_layer >= 4 else x
 
 		sub_emb	= torch.index_select(x, 0, sub)
@@ -91,8 +138,8 @@ class HoGRNBase(BaseModel):
 		return sub_emb, rel_emb, x, cor
 
 class HoGRN_TransE(HoGRNBase):
-	def __init__(self, edge_index, edge_type, params=None):
-		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+	def __init__(self, edge_index, edge_type, rel_edge_index=None, rel_edge_weight=None, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, rel_edge_index, rel_edge_weight, params)
 		self.drop = torch.nn.Dropout(self.p.hid_drop)
 
 	def forward(self, sub, rel):
@@ -106,8 +153,8 @@ class HoGRN_TransE(HoGRNBase):
 		return score, cor
 
 class HoGRN_DistMult(HoGRNBase):
-	def __init__(self, edge_index, edge_type, params=None):
-		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+	def __init__(self, edge_index, edge_type, rel_edge_index=None, rel_edge_weight=None, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, rel_edge_index, rel_edge_weight, params)
 		self.drop = torch.nn.Dropout(self.p.hid_drop)
 
 	def forward(self, sub, rel):
@@ -122,8 +169,8 @@ class HoGRN_DistMult(HoGRNBase):
 		return score, cor
 
 class HoGRN_ConvE(HoGRNBase):
-	def __init__(self, edge_index, edge_type, params=None):
-		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, params)
+	def __init__(self, edge_index, edge_type, rel_edge_index=None, rel_edge_weight=None, params=None):
+		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, rel_edge_index, rel_edge_weight, params)
 
 		self.bn0	= torch.nn.BatchNorm2d(1)
 		self.bn1	= torch.nn.BatchNorm2d(self.p.num_filt)

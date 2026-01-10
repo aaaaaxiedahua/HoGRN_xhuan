@@ -1,6 +1,7 @@
 from helper import *
 from data_loader import *
 from model.models import *
+from dual_graph import build_static_relation_graph
 
 class Runner(object):
 
@@ -91,6 +92,22 @@ class Runner(object):
 		}
 
 		self.edge_index, self.edge_type = self.construct_adj()
+		self.rel_edge_index, self.rel_edge_weight = None, None
+		if getattr(self.p, 'dual_rel', False):
+			self.rel_edge_index, self.rel_edge_weight = build_static_relation_graph(
+				self.edge_index,
+				self.edge_type,
+				self.p.num_ent,
+				self.p.num_rel * 2,
+				walk=getattr(self.p, 'dual_walk', 'path'),
+				weight=getattr(self.p, 'dual_weight', 'ppmi'),
+				hops=getattr(self.p, 'dual_hops', 2),
+				topk=getattr(self.p, 'dual_topk', 20),
+				min_count=getattr(self.p, 'dual_min_count', 1),
+				sym=getattr(self.p, 'dual_sym', True),
+			)
+			self.rel_edge_index = self.rel_edge_index.to(self.device)
+			self.rel_edge_weight = self.rel_edge_weight.to(self.device)
 
 	def construct_adj(self):
 		"""
@@ -139,9 +156,9 @@ class Runner(object):
 		"""
 		model_name = '{}_{}'.format(model, score_func)
 
-		if   model_name.lower()	== 'hogrn_transe': 		model = HoGRN_TransE(self.edge_index, self.edge_type, params=self.p)
-		elif model_name.lower()	== 'hogrn_distmult': 	model = HoGRN_DistMult(self.edge_index, self.edge_type, params=self.p)
-		elif model_name.lower()	== 'hogrn_conve': 		model = HoGRN_ConvE(self.edge_index, self.edge_type, params=self.p)
+		if   model_name.lower()	== 'hogrn_transe': 		model = HoGRN_TransE(self.edge_index, self.edge_type, self.rel_edge_index, self.rel_edge_weight, params=self.p)
+		elif model_name.lower()	== 'hogrn_distmult': 	model = HoGRN_DistMult(self.edge_index, self.edge_type, self.rel_edge_index, self.rel_edge_weight, params=self.p)
+		elif model_name.lower()	== 'hogrn_conve': 		model = HoGRN_ConvE(self.edge_index, self.edge_type, self.rel_edge_index, self.rel_edge_weight, params=self.p)
 		else: raise NotImplementedError
 
 		model.to(self.device)
@@ -365,6 +382,18 @@ if __name__ == '__main__':
 	parser.add_argument('-rel_mask',  	dest='rel_mask', 	default=0,  	type=float,	help='Dropout in inter-relation learning')
 	parser.add_argument('-chan_drop',  	dest='chan_drop', 	default=0,  	type=float,	help='Dropout in intra-relation learning')
 	parser.add_argument('-edge_drop',  	dest='edge_drop', 	default=0,  	type=float,	help='Dropout in edge')
+
+	# Dual-graph (relation graph) settings
+	parser.add_argument('-dual_rel',		dest='dual_rel',		action='store_true',	help='Enable dual relation graph message passing')
+	parser.add_argument('-dual_walk',		dest='dual_walk',		default='path',	choices=['path', 'share_src', 'share_dst', 'mixed'], help='Relation co-occurrence pattern')
+	parser.add_argument('-dual_weight',	dest='dual_weight',	default='ppmi',	choices=['count', 'pmi', 'ppmi'], help='Edge weight type for relation graph')
+	parser.add_argument('-dual_hops',		dest='dual_hops',		type=int,	default=2,	help='Max hop length for relation-graph diffusion (>=2); 2 disables diffusion')
+	parser.add_argument('-dual_topk',		dest='dual_topk',		type=int,	default=20,	help='Top-k neighbors per relation type in relation graph')
+	parser.add_argument('-dual_min_count', dest='dual_min_count',	type=int,	default=1,	help='Minimum co-occurrence count for relation graph edges')
+	parser.add_argument('-dual_asym',		dest='dual_sym',		action='store_false',	help='Do not symmetrize the relation graph')
+	parser.set_defaults(dual_sym=True)
+	parser.add_argument('-dual_alpha',	dest='dual_alpha',	type=float,	default=0.1,	help='Residual step size for dual relation update')
+	parser.add_argument('-dual_drop',		dest='dual_drop',		type=float,	default=0.0,	help='Dropout in dual relation update')
 
 	# Relational contrastive loss
 	parser.add_argument('-temperature', dest='temperature', default=1,  	type=float,	help='temperature coefficient')

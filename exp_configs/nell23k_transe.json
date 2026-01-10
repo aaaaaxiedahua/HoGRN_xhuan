@@ -12,5 +12,14 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "hid_drop": 0.2,
-  "sim_decay": 1e-05
+  "sim_decay": 1e-05,
+  "dual_rel": true,
+  "dual_walk": "path",
+  "dual_weight": "ppmi",
+  "dual_hops": 3,
+  "dual_topk": 20,
+  "dual_min_count": 2,
+  "dual_sym": true,
+  "dual_alpha": 0.1,
+  "dual_drop": 0.1
 }
