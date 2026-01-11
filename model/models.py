@@ -195,6 +195,14 @@ class HoGRNBase(BaseModel):
 		W = sinkhorn_distance(cost_flat, a, b, eps=eps, iters=sinkhorn_iters)  # [B*C]
 		return (-W).view(B, C)
 
+	def rel_transform(self, ent_embed, rel_embed):
+		# Mirror HoGRNConv.rel_transform for OT path
+		if   self.p.opn == 'corr': 	trans_embed  = ccorr(ent_embed, rel_embed)
+		elif self.p.opn == 'sub': 	trans_embed  = ent_embed - rel_embed
+		elif self.p.opn == 'mult': 	trans_embed  = ent_embed * rel_embed
+		else: raise NotImplementedError
+		return trans_embed
+
 class HoGRN_TransE(HoGRNBase):
 	def __init__(self, edge_index, edge_type, rel_edge_index=None, rel_edge_weight=None, params=None):
 		super(self.__class__, self).__init__(edge_index, edge_type, params.num_rel, rel_edge_index, rel_edge_weight, params)
