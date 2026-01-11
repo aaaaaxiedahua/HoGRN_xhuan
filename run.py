@@ -94,6 +94,11 @@ class Runner(object):
 
 		self.sr2o_all = {k: list(v) for k, v in sr2o.items()} # train+valid+test
 
+		# Precompute fixed-size neighbor cache for OT regularizer (includes self loop)
+		self.neighbor_idx, self.neighbor_mask = None, None
+		if getattr(self.p, 'ot_enable', False):
+			self.neighbor_idx, self.neighbor_mask = self._build_neighbor_cache(getattr(self.p, 'ot_neighbors', 8))
+
 		self.triples  = ddict(list)
 		for (sub, rel), obj in self.sr2o.items():
 			self.triples['train'].append({'triple':(sub, rel, -1), 'label': self.sr2o[(sub, rel)], 'sub_samp': 1})
@@ -167,6 +172,33 @@ class Runner(object):
 				num_rel_nodes, num_rel_edges, avg_deg, w_min, w_mean, w_std, w_max, time.time() - t_rel
 			))
 
+	def _build_neighbor_cache(self, max_neighbors):
+		"""
+		Build a fixed-size neighbor list for each entity for OT regularizer.
+		Includes a self-loop to avoid empty neighborhoods.
+		"""
+		neighbors = [[] for _ in range(self.p.num_ent)]
+		for sub, rel, obj in self.data['train']:
+			neighbors[sub].append(obj)
+			neighbors[obj].append(sub)
+
+		rng = np.random.RandomState(self.p.seed)
+		idx = np.zeros((self.p.num_ent, max_neighbors), dtype=np.int64)
+		mask = np.zeros((self.p.num_ent, max_neighbors), dtype=np.bool_)
+
+		for ent_id in range(self.p.num_ent):
+			ent_neighbors = neighbors[ent_id]
+			# ensure non-empty by adding self
+			if ent_id not in ent_neighbors:
+				ent_neighbors.append(ent_id)
+			if len(ent_neighbors) > max_neighbors:
+				chosen = rng.choice(len(ent_neighbors), max_neighbors, replace=False)
+				ent_neighbors = [ent_neighbors[i] for i in chosen]
+			for j, nb in enumerate(ent_neighbors[:max_neighbors]):
+				idx[ent_id, j] = nb
+				mask[ent_id, j] = True
+		return torch.LongTensor(idx), torch.BoolTensor(mask)
+
 	def construct_adj(self):
 		"""
 		Construct the adjacency matrix for GCN.
@@ -207,6 +239,8 @@ class Runner(object):
 		self.load_data()
 		self.model        = self.add_model(self.p.model, self.p.score_func)
 		self.optimizer    = self.add_optimizer(self.model.parameters())
+		if self.neighbor_idx is not None:
+			self.model.set_neighbors(self.neighbor_idx.to(self.device), self.neighbor_mask.to(self.device))
 
 	def add_model(self, model, score_func):
 		"""
@@ -333,6 +367,7 @@ class Runner(object):
 		"""
 		self.model.train()
 		losses = []
+		ot_losses = []
 		train_iter = iter(self.data_iter['train'])
 
 		for step, batch in enumerate(train_iter):
@@ -341,6 +376,29 @@ class Runner(object):
 
 			pred, cor	= self.model.forward(sub, rel)
 			loss	= self.model.loss(pred, label)
+
+			if getattr(self.p, 'ot_enable', False):
+				with torch.no_grad():
+					# sample one positive per row from the smoothed label
+					pos_mask = label > (1.0 / float(self.p.num_ent) + 1e-6)
+					pos_probs = pos_mask.float()
+					pos_probs = pos_probs / pos_probs.sum(dim=1, keepdim=True)
+					pos_idx = torch.multinomial(pos_probs, 1, replacement=True).squeeze(1)
+					neg_probs = (1.0 - pos_mask.float())
+					neg_probs = neg_probs / neg_probs.sum(dim=1, keepdim=True)
+					neg_idx = torch.multinomial(neg_probs, self.p.ot_neg, replacement=True)
+					cand_ids = torch.cat([pos_idx.unsqueeze(1), neg_idx], dim=1)
+				ot_scores = self.model.compute_ot_scores(
+					sub, rel, cand_ids,
+					eps=self.p.ot_eps,
+					sinkhorn_iters=self.p.ot_sinkhorn_iters
+				)
+				if ot_scores is not None:
+					target = torch.zeros_like(ot_scores)
+					target[:, 0] = 1.0
+					ot_loss = F.binary_cross_entropy_with_logits(ot_scores, target)
+					ot_losses.append(float(ot_loss.detach().cpu()))
+					loss = loss + self.p.ot_lambda * ot_loss
 
 			if self.p.sim_decay > 0:
 				loss += self.p.sim_decay * cor
@@ -353,7 +411,11 @@ class Runner(object):
 			# 	self.logger.info('[E:{}| {}]: Train Loss:{:.5}'.format(epoch, step, np.mean(losses)))
 
 		loss = np.mean(losses)
-		self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
+		if ot_losses:
+			ot_loss_avg = float(np.mean(ot_losses))
+			self.logger.info('[Epoch:{}]:  Training Loss:{:.4} | OT Loss:{:.4}'.format(epoch, loss, ot_loss_avg))
+		else:
+			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}'.format(epoch, loss))
 		return loss
 
 	def fit(self):
@@ -466,6 +528,14 @@ if __name__ == '__main__':
 	parser.add_argument('-k_h',	  		dest='k_h', 		default=10,   	type=int, 	help='ConvE: k_h')
 	parser.add_argument('-num_filt',  	dest='num_filt', 	default=32,   	type=int, 	help='ConvE: Number of filters in convolution')
 	parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=3,   	type=int, 	help='ConvE: Kernel size to use')
+
+	# OT regularizer
+	parser.add_argument('-ot',			dest='ot_enable',	action='store_true',	help='Enable OT-based neighborhood alignment')
+	parser.add_argument('-ot_neighbors',dest='ot_neighbors',type=int,	default=8,	help='Number of neighbors per entity for OT')
+	parser.add_argument('-ot_neg',		dest='ot_neg',		type=int,	default=32,	help='Number of negative tails per triple for OT')
+	parser.add_argument('-ot_eps',		dest='ot_eps',		type=float,	default=0.1,	help='Sinkhorn epsilon')
+	parser.add_argument('-ot_sinkhorn_iters', dest='ot_sinkhorn_iters', type=int, default=20, help='Sinkhorn iterations')
+	parser.add_argument('-ot_lambda',	dest='ot_lambda',	type=float, default=0.1, help='OT loss weight')
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')

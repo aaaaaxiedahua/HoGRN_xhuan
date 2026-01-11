@@ -2,6 +2,7 @@ from re import X
 from helper import *
 from model.hogrn_conv import HoGRNConv
 from model.dual_rel import DualRelGCN
+from model.ot import sinkhorn_distance
 
 class BaseModel(torch.nn.Module):
 	def __init__(self, params):
@@ -58,6 +59,14 @@ class HoGRNBase(BaseModel):
 		self.conv4 = HoGRNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer >= 4 else None
 
 		self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
+		self.register_buffer('neighbor_idx', None)
+		self.register_buffer('neighbor_mask', None)
+		self._cached_x = None
+		self._cached_r = None
+
+	def set_neighbors(self, neighbor_idx, neighbor_mask):
+		self.neighbor_idx = neighbor_idx
+		self.neighbor_mask = neighbor_mask
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -136,7 +145,55 @@ class HoGRNBase(BaseModel):
 		else:
 			cor = 0.
 
+		self._cached_x = x
+		self._cached_r = r
 		return sub_emb, rel_emb, x, cor
+
+	def compute_ot_scores(self, sub, rel, cand_ids, eps=0.1, sinkhorn_iters=20):
+		"""
+		Compute OT alignment scores (negative Wasserstein distance) between head neighborhoods
+		and candidate tail neighborhoods.
+		cand_ids: [B, C] where C includes 1 positive + negs
+		"""
+		if self.neighbor_idx is None or self._cached_x is None or self._cached_r is None:
+			return None
+
+		x = self._cached_x
+		r_all = self._cached_r
+		B, C = cand_ids.size()
+		device = x.device
+
+		# Head neighbors
+		head_neighbors = self.neighbor_idx.index_select(0, sub)          # [B, K]
+		head_mask = self.neighbor_mask.index_select(0, sub)              # [B, K]
+		K = head_neighbors.size(1)
+		head_emb = x.index_select(0, head_neighbors.view(-1)).view(B, K, -1)
+		rel_emb = r_all.index_select(0, rel).unsqueeze(1)                # [B,1,D]
+		head_trans = self.rel_transform(head_emb, rel_emb.expand(-1, K, -1))
+
+		# Tail neighbors
+		tail_neighbors = self.neighbor_idx.index_select(0, cand_ids.view(-1)).view(B, C, K)
+		tail_mask = self.neighbor_mask.index_select(0, cand_ids.view(-1)).view(B, C, K)
+		tail_emb = x.index_select(0, tail_neighbors.view(-1)).view(B, C, K, -1)
+
+		# normalize weights
+		head_w = head_mask.float()
+		head_w = head_w / head_w.sum(dim=1, keepdim=True).clamp_min(1e-6)
+		tail_w = tail_mask.float()
+		tail_w = tail_w / tail_w.sum(dim=2, keepdim=True).clamp_min(1e-6)
+
+		# cost matrix [B, C, K, K]
+		h_exp = head_trans.unsqueeze(1).unsqueeze(3)                     # [B,1,K,1,D]
+		t_exp = tail_emb.unsqueeze(2)                                    # [B,C,1,K,D]
+		cost = (h_exp - t_exp).pow(2).sum(dim=-1).sqrt()
+
+		# flatten batch-candidate for sinkhorn
+		cost_flat = cost.view(-1, K, K)
+		a = head_w.unsqueeze(1).expand(-1, C, -1).contiguous().view(-1, K)
+		b = tail_w.view(-1, K)
+
+		W = sinkhorn_distance(cost_flat, a, b, eps=eps, iters=sinkhorn_iters)  # [B*C]
+		return (-W).view(B, C)
 
 class HoGRN_TransE(HoGRNBase):
 	def __init__(self, edge_index, edge_type, rel_edge_index=None, rel_edge_weight=None, params=None):

@@ -20,5 +20,20 @@
   "k_w": 10,
   "k_h": 20,
   "num_filt": 250,
-  "ker_sz": 7
+  "ker_sz": 7,
+  "dual_rel": true,
+  "dual_walk": "path",
+  "dual_weight": "ppmi",
+  "dual_hops": 2,
+  "dual_topk": 5,
+  "dual_min_count": 2,
+  "dual_sym": true,
+  "dual_alpha": 0.05,
+  "dual_drop": 0.0,
+  "ot_enable": true,
+  "ot_neighbors": 6,
+  "ot_neg": 32,
+  "ot_eps": 0.05,
+  "ot_sinkhorn_iters": 15,
+  "ot_lambda": 0.05
 }

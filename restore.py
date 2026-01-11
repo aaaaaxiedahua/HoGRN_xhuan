@@ -92,6 +92,9 @@ class Runner(object):
 				sr2o[(obj, rel+self.p.num_rel)].add(sub)
 
 		self.sr2o_all = {k: list(v) for k, v in sr2o.items()} # train+valid+test
+		self.neighbor_idx, self.neighbor_mask = None, None
+		if getattr(self.p, 'ot_enable', False):
+			self.neighbor_idx, self.neighbor_mask = self._build_neighbor_cache(getattr(self.p, 'ot_neighbors', 8))
 
 		self.triples  = ddict(list)
 		for (sub, rel), obj in self.sr2o.items():
@@ -166,6 +169,28 @@ class Runner(object):
 				num_rel_nodes, num_rel_edges, avg_deg, w_min, w_mean, w_std, w_max, time.time() - t_rel
 			))
 
+	def _build_neighbor_cache(self, max_neighbors):
+		neighbors = [[] for _ in range(self.p.num_ent)]
+		for sub, rel, obj in self.data['train']:
+			neighbors[sub].append(obj)
+			neighbors[obj].append(sub)
+
+		rng = np.random.RandomState(self.p.seed)
+		idx = np.zeros((self.p.num_ent, max_neighbors), dtype=np.int64)
+		mask = np.zeros((self.p.num_ent, max_neighbors), dtype=np.bool_)
+
+		for ent_id in range(self.p.num_ent):
+			ent_neighbors = neighbors[ent_id]
+			if ent_id not in ent_neighbors:
+				ent_neighbors.append(ent_id)
+			if len(ent_neighbors) > max_neighbors:
+				chosen = rng.choice(len(ent_neighbors), max_neighbors, replace=False)
+				ent_neighbors = [ent_neighbors[i] for i in chosen]
+			for j, nb in enumerate(ent_neighbors[:max_neighbors]):
+				idx[ent_id, j] = nb
+				mask[ent_id, j] = True
+		return torch.LongTensor(idx), torch.BoolTensor(mask)
+
 	def construct_adj(self):
 		"""
 		Construct the adjacency matrix for GCN.
@@ -206,6 +231,8 @@ class Runner(object):
 		self.load_data()
 		self.model        = self.add_model(self.p.model, self.p.score_func)
 		self.optimizer    = self.add_optimizer(self.model.parameters())
+		if self.neighbor_idx is not None:
+			self.model.set_neighbors(self.neighbor_idx.to(self.device), self.neighbor_mask.to(self.device))
 
 	def add_model(self, model, score_func):
 		"""
@@ -408,6 +435,14 @@ if __name__ == '__main__':
 	parser.add_argument('-k_h',	  		dest='k_h', 		default=10,   	type=int, 	help='ConvE: k_h')
 	parser.add_argument('-num_filt',  	dest='num_filt', 	default=32,   	type=int, 	help='ConvE: Number of filters in convolution')
 	parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=3,   	type=int, 	help='ConvE: Kernel size to use')
+
+	# OT regularizer
+	parser.add_argument('-ot',			dest='ot_enable',	action='store_true',	help='Enable OT-based neighborhood alignment')
+	parser.add_argument('-ot_neighbors',dest='ot_neighbors',type=int,	default=8,	help='Number of neighbors per entity for OT')
+	parser.add_argument('-ot_neg',		dest='ot_neg',		type=int,	default=32,	help='Number of negative tails per triple for OT')
+	parser.add_argument('-ot_eps',		dest='ot_eps',		type=float,	default=0.1,	help='Sinkhorn epsilon')
+	parser.add_argument('-ot_sinkhorn_iters', dest='ot_sinkhorn_iters', type=int, default=20, help='Sinkhorn iterations')
+	parser.add_argument('-ot_lambda',	dest='ot_lambda',	type=float, default=0.1, help='OT loss weight')
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
