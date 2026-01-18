@@ -429,7 +429,7 @@ if __name__ == '__main__':
 
 		print(f"✓ Config loaded successfully")
 
-	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
+	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H-%M-%S')
 
 	# set_gpu(args.gpu)
 	np.random.seed(args.seed)
