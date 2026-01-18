@@ -36,3 +36,6 @@ The full checkpoint files can be downloaded [here](https://drive.google.com/file
 Thanks to the following implementations:
 * [CompGCN](https://github.com/malllabiisc/CompGCN)
 * [PyTorch Geometric](https://github.com/pyg-team/pytorch_geometric)
+
+
+python run.py -config_file exp_configs/nell23k_conve.json
