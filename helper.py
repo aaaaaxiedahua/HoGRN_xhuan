@@ -25,6 +25,9 @@ def get_logger(name, log_dir, config_dir):
 	"""
 	Creates a logger object
 	"""
+	# Create log directory if it doesn't exist
+	os.makedirs(log_dir, exist_ok=True)
+
 	config_dict = json.load(open( config_dir + 'log_config.json'))
 	config_dict['handlers']['file_handler']['filename'] = log_dir + name.replace('/', '-')
 	logging.config.dictConfig(config_dict)
