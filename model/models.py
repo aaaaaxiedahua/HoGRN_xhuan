@@ -36,6 +36,37 @@ class HoGRNBase(BaseModel):
 
 		self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
 
+		# ===== GloMem-HoGRN: Global Memory Enhancement =====
+		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
+			from model.global_memory import GlobalWriteModule, GlobalReadModule, MultiHeadGlobalMemory
+
+			if hasattr(self.p, 'global_memory_heads') and self.p.global_memory_heads > 1:
+				# Multi-head global memory
+				self.global_memory_module = MultiHeadGlobalMemory(
+					dim=self.p.init_dim,
+					num_heads=self.p.global_memory_heads,
+					attention_type=getattr(self.p, 'global_attention_type', 'concat'),
+					gate_type=getattr(self.p, 'global_gate_type', 'mlp')
+				)
+				print(f"[GloMem] Multi-head mode enabled with {self.p.global_memory_heads} heads")
+			else:
+				# Single global memory
+				self.global_memory = get_param((1, self.p.init_dim))
+				self.global_write = GlobalWriteModule(
+					dim=self.p.init_dim,
+					attention_type=getattr(self.p, 'global_attention_type', 'concat')
+				)
+				self.global_read = GlobalReadModule(
+					dim=self.p.init_dim,
+					gate_type=getattr(self.p, 'global_gate_type', 'mlp'),
+					use_residual=getattr(self.p, 'global_use_residual', False)
+				)
+				print(f"[GloMem] Single-head mode enabled")
+
+			# For storing intermediate values for analysis
+			self.last_write_attention = None
+			self.last_read_gates = None
+
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
 		random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
@@ -70,8 +101,25 @@ class HoGRNBase(BaseModel):
 		else:
 			edge_index, edge_type = self.edge_index, self.edge_type
 
+		# ===== GloMem-HoGRN: Global Memory Enhancement =====
+		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
+			if hasattr(self, 'global_memory_module'):
+				# Multi-head global memory
+				x_input, read_gates = self.global_memory_module(self.init_embed)
+			else:
+				# Single global memory: Write-Read cycle
+				g_new, write_attention = self.global_write(self.global_memory, self.init_embed)
+				x_input, read_gates = self.global_read(self.init_embed, g_new)
+
+				# Store for analysis
+				if self.training:
+					self.last_write_attention = write_attention
+					self.last_read_gates = read_gates
+		else:
+			x_input = self.init_embed
+
 		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
-		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
+		x, r	= self.conv1(x_input, edge_index, edge_type, rel_embed=r)
 		x	= drop1(x)
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 2 else (x, r)
 		x	= drop2(x) 							if self.p.gcn_layer >= 2 else x
