@@ -328,6 +328,9 @@ class Runner(object):
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser(description='Parser For Arguments', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
+	# Config file support
+	parser.add_argument('-config_file',	dest='config_file',	default=None,		help='Path to JSON config file (e.g., exp_configs/nell23k_conve.json)')
+
 	parser.add_argument('-name',		dest='name',		default='testrun',		help='Set run name for saving/restoring models')
 	parser.add_argument('-data',		dest='dataset',		default='FB15K-237-10',	help='Dataset to use.')
 	parser.add_argument('-model',		dest='model',		default='hogrn',		help='Model Name')
@@ -389,6 +392,42 @@ if __name__ == '__main__':
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
 	args = parser.parse_args()
+
+	# Load config file if specified
+	if args.config_file is not None:
+		import json
+		print(f"Loading config from: {args.config_file}")
+		with open(args.config_file, 'r') as f:
+			config = json.load(f)
+
+		# Override args with config values (command line args take precedence)
+		for key, value in config.items():
+			# Skip special keys starting with underscore
+			if key.startswith('_'):
+				continue
+
+			# Convert key format: batch -> batch_size
+			if key == 'batch':
+				key = 'batch_size'
+			elif key == 'data':
+				key = 'dataset'
+			elif key == 'epoch':
+				key = 'max_epochs'
+
+			# Only override if not explicitly set in command line
+			if hasattr(args, key):
+				# Check if this was set by user or is default value
+				default_value = parser.get_default(key)
+				current_value = getattr(args, key)
+
+				# Override only if current value is default
+				if current_value == default_value:
+					setattr(args, key, value)
+			else:
+				# Add new attribute if it doesn't exist
+				setattr(args, key, value)
+
+		print(f"✓ Config loaded successfully")
 
 	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H:%M:%S')
 
