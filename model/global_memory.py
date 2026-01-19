@@ -126,16 +126,18 @@ class GlobalReadModule(nn.Module):
         use_residual (bool): Whether to use residual connection
     """
 
-    def __init__(self, dim, gate_type='mlp', use_residual=False):
+    def __init__(self, dim, gate_type='mlp', use_residual=False, extra_input_dim=0):
         super(GlobalReadModule, self).__init__()
         self.dim = dim
         self.gate_type = gate_type
         self.use_residual = use_residual
+        self.extra_input_dim = extra_input_dim
+        input_dim = 2 * dim + extra_input_dim
 
         if gate_type == 'mlp':
             # Two-layer MLP gate network
             self.gate_network = nn.Sequential(
-                nn.Linear(2 * dim, dim),
+                nn.Linear(input_dim, dim),
                 nn.ReLU(),
                 nn.Dropout(0.1),
                 nn.Linear(dim, 1),
@@ -145,19 +147,19 @@ class GlobalReadModule(nn.Module):
         elif gate_type == 'linear':
             # Single linear layer gate
             self.gate_network = nn.Sequential(
-                nn.Linear(2 * dim, 1),
+                nn.Linear(input_dim, 1),
                 nn.Sigmoid()
             )
 
         elif gate_type == 'highway':
             # Highway network style
-            self.transform_gate = nn.Linear(2 * dim, dim)
-            self.carry_gate = nn.Linear(2 * dim, dim)
+            self.transform_gate = nn.Linear(input_dim, dim)
+            self.carry_gate = nn.Linear(input_dim, dim)
 
         else:
             raise ValueError(f"Unknown gate_type: {gate_type}")
 
-    def forward(self, entity_embeds, global_memory):
+    def forward(self, entity_embeds, global_memory, extra_features=None):
         """
         Forward pass of global read module.
 
@@ -174,8 +176,14 @@ class GlobalReadModule(nn.Module):
         # Expand global memory: (1, d) -> (N, d)
         g_expanded = global_memory.expand(N, d)
 
-        # Concatenate features: (N, 2d)
+        # Concatenate features: (N, 2d [+ extra])
         concat = torch.cat([entity_embeds, g_expanded], dim=1)
+        if extra_features is None and self.extra_input_dim > 0:
+            extra_features = entity_embeds.new_zeros((N, self.extra_input_dim))
+        if extra_features is not None:
+            if extra_features.dim() == 1:
+                extra_features = extra_features.unsqueeze(1)
+            concat = torch.cat([concat, extra_features], dim=1)
 
         if self.gate_type in ['mlp', 'linear']:
             # Compute gate values: (N, 1)
@@ -217,7 +225,7 @@ class MultiHeadGlobalMemory(nn.Module):
         gate_type (str): Gate type for read module
     """
 
-    def __init__(self, dim, num_heads=4, attention_type='concat', gate_type='mlp'):
+    def __init__(self, dim, num_heads=4, attention_type='concat', gate_type='mlp', extra_input_dim=0):
         super(MultiHeadGlobalMemory, self).__init__()
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
 
@@ -238,14 +246,14 @@ class MultiHeadGlobalMemory(nn.Module):
         ])
 
         self.read_modules = nn.ModuleList([
-            GlobalReadModule(self.head_dim, gate_type, use_residual=False)
+            GlobalReadModule(self.head_dim, gate_type, use_residual=False, extra_input_dim=extra_input_dim)
             for _ in range(num_heads)
         ])
 
         # Output projection
         self.output_proj = nn.Linear(dim, dim)
 
-    def forward(self, entity_embeds):
+    def forward(self, entity_embeds, extra_features=None):
         """
         Forward pass of multi-head global memory.
 
@@ -273,7 +281,7 @@ class MultiHeadGlobalMemory(nn.Module):
 
             # Write-Read cycle
             g_new, _ = self.write_modules[i](g_i, h_i)
-            h_enhanced, beta = self.read_modules[i](h_i, g_new)
+            h_enhanced, beta = self.read_modules[i](h_i, g_new, extra_features=extra_features)
 
             enhanced_heads.append(h_enhanced)
             all_betas.append(beta)

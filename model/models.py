@@ -35,31 +35,35 @@ class HoGRNBase(BaseModel):
 		self.conv4 = HoGRNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer >= 4 else None
 
 		self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
+		self.register_buffer('node_deg', self._compute_node_degree())
 
 		# ===== GloMem-HoGRN: Global Memory Enhancement =====
 		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
 			from model.global_memory import GlobalWriteModule, GlobalReadModule, MultiHeadGlobalMemory
+			mem_dim = self.p.gcn_dim
 
 			if hasattr(self.p, 'global_memory_heads') and self.p.global_memory_heads > 1:
 				# Multi-head global memory
 				self.global_memory_module = MultiHeadGlobalMemory(
-					dim=self.p.init_dim,
+					dim=mem_dim,
 					num_heads=self.p.global_memory_heads,
 					attention_type=getattr(self.p, 'global_attention_type', 'concat'),
-					gate_type=getattr(self.p, 'global_gate_type', 'mlp')
+					gate_type=getattr(self.p, 'global_gate_type', 'mlp'),
+					extra_input_dim=1
 				)
 				print(f"[GloMem] Multi-head mode enabled with {self.p.global_memory_heads} heads")
 			else:
 				# Single global memory
-				self.global_memory = get_param((1, self.p.init_dim))
+				self.global_memory = get_param((1, mem_dim))
 				self.global_write = GlobalWriteModule(
-					dim=self.p.init_dim,
+					dim=mem_dim,
 					attention_type=getattr(self.p, 'global_attention_type', 'concat')
 				)
 				self.global_read = GlobalReadModule(
-					dim=self.p.init_dim,
+					dim=mem_dim,
 					gate_type=getattr(self.p, 'global_gate_type', 'mlp'),
-					use_residual=getattr(self.p, 'global_use_residual', False)
+					use_residual=getattr(self.p, 'global_use_residual', False),
+					extra_input_dim=1
 				)
 				print(f"[GloMem] Single-head mode enabled")
 
@@ -71,6 +75,13 @@ class HoGRNBase(BaseModel):
 		n_edges = edge_index.shape[1]
 		random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
 		return edge_index[:, random_indices], edge_type[random_indices]
+
+	def _compute_node_degree(self):
+		row = self.edge_index[0]
+		edge_weight = torch.ones_like(row, dtype=torch.float)
+		deg = scatter_add(edge_weight, row, dim=0, dim_size=self.p.num_ent)
+		deg = torch.log1p(deg)
+		return deg / (deg.max() + 1e-12)
 
 	def _cul_cor(self, rel):
 		if self.p.rel_drop > 0:
@@ -101,26 +112,25 @@ class HoGRNBase(BaseModel):
 		else:
 			edge_index, edge_type = self.edge_index, self.edge_type
 
+		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
+		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
+		x	= drop1(x)
+
 		# ===== GloMem-HoGRN: Global Memory Enhancement =====
 		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
+			deg_input = self.node_deg.unsqueeze(1)
 			if hasattr(self, 'global_memory_module'):
 				# Multi-head global memory
-				x_input, read_gates = self.global_memory_module(self.init_embed)
+				x, read_gates = self.global_memory_module(x, extra_features=deg_input)
 			else:
 				# Single global memory: Write-Read cycle
-				g_new, write_attention = self.global_write(self.global_memory, self.init_embed)
-				x_input, read_gates = self.global_read(self.init_embed, g_new)
+				g_new, write_attention = self.global_write(self.global_memory, x)
+				x, read_gates = self.global_read(x, g_new, extra_features=deg_input)
 
 				# Store for analysis
 				if self.training:
 					self.last_write_attention = write_attention
 					self.last_read_gates = read_gates
-		else:
-			x_input = self.init_embed
-
-		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
-		x, r	= self.conv1(x_input, edge_index, edge_type, rel_embed=r)
-		x	= drop1(x)
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 2 else (x, r)
 		x	= drop2(x) 							if self.p.gcn_layer >= 2 else x
 		x, r	= self.conv3(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 3 else (x, r)

@@ -65,6 +65,18 @@ class GloMemAnalyzer:
             runner.p.num_ent
         ).cpu().numpy()
 
+    def _get_global_memory_input(self):
+        r = self.model.init_rel if self.model.p.score_func != 'transe' else torch.cat(
+            [self.model.init_rel, -self.model.init_rel], dim=0
+        )
+        x, _ = self.model.conv1(self.model.init_embed, self.model.edge_index, self.model.edge_type, rel_embed=r)
+        return x
+
+    def _get_degree_features(self):
+        if hasattr(self.model, 'node_deg'):
+            return self.model.node_deg.unsqueeze(1)
+        return None
+
     def analyze_gate_distribution(self, save_path='./analysis/gate_distribution.png'):
         """
         Analyze the distribution of gate values across different node degrees.
@@ -80,19 +92,22 @@ class GloMemAnalyzer:
         self.model.eval()
 
         with torch.no_grad():
+            x_input = self._get_global_memory_input()
+            deg_input = self._get_degree_features()
             # Get gate values for all entities
             if hasattr(self.model, 'global_memory_module'):
                 # Multi-head version
-                _, gate_values = self.model.global_memory_module(self.model.init_embed)
+                _, gate_values = self.model.global_memory_module(x_input, extra_features=deg_input)
             else:
                 # Single-head version
                 g_new, _ = self.model.global_write(
                     self.model.global_memory,
-                    self.model.init_embed
+                    x_input
                 )
                 _, gate_values = self.model.global_read(
-                    self.model.init_embed,
-                    g_new
+                    x_input,
+                    g_new,
+                    extra_features=deg_input
                 )
 
             gate_values = gate_values.cpu().numpy()
@@ -204,7 +219,10 @@ class GloMemAnalyzer:
                 # Multi-head: use first head
                 g = self.model.global_memory_module.global_memories[0:1, :]
 
-            H = self.model.init_embed  # (N, d)
+            H = self._get_global_memory_input()  # (N, d)
+            if hasattr(self.model, 'global_memory_module'):
+                head_dim = self.model.global_memory_module.head_dim
+                H = H[:, :head_dim]
 
             # Compute cosine similarity
             g_norm = torch.nn.functional.normalize(g, p=2, dim=1)
