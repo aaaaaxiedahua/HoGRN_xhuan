@@ -413,6 +413,8 @@ if __name__ == '__main__':
 				key = 'dataset'
 			elif key == 'epoch':
 				key = 'max_epochs'
+			elif key == 'gcn_drop':
+				key = 'dropout'
 
 			# Only override if not explicitly set in command line
 			if hasattr(args, key):

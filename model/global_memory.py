@@ -83,7 +83,7 @@ class GlobalWriteModule(nn.Module):
             # Compute attention scores: (N, 1)
             e = self.leaky_relu(torch.matmul(concat, self.attention_vec))
 
-        elif attention_type == 'dot':
+        elif self.attention_type == 'dot':
             # Dot-product attention: g^T h_i
             e = torch.matmul(entity_embeds, global_memory.t())  # (N, 1)
             e = e / np.sqrt(d)  # Scaling for numerical stability
