@@ -1,6 +1,4 @@
 {
-  "lr": 0.0005,
-  "l2": 0.00001,
   "_entry": "run.py",
   "data": "NELL23K",
   "rel_reason": true,

@@ -39,3 +39,5 @@ Thanks to the following implementations:
 
 
 python run.py -config_file exp_configs/nell23k_conve.json
+
+python analyze_glomem.py --checkpoint checkpoints/testrun_19_01_2026_18-18-40 --dataset NELL23K --output_dir analysis/testrun_19_01_2026_18-18-40

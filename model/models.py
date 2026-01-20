@@ -119,13 +119,27 @@ class HoGRNBase(BaseModel):
 		# ===== GloMem-HoGRN: Global Memory Enhancement =====
 		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
 			deg_input = self.node_deg.unsqueeze(1)
+			rel_ctx = torch.index_select(r, 0, rel).mean(dim=0, keepdim=True)
 			if hasattr(self, 'global_memory_module'):
 				# Multi-head global memory
-				x, read_gates = self.global_memory_module(x, extra_features=deg_input)
+				x, read_gates = self.global_memory_module(
+					x,
+					extra_features=deg_input,
+					relation_context=rel_ctx
+				)
 			else:
 				# Single global memory: Write-Read cycle
-				g_new, write_attention = self.global_write(self.global_memory, x)
-				x, read_gates = self.global_read(x, g_new, extra_features=deg_input)
+				g_new, write_attention = self.global_write(
+					self.global_memory,
+					x,
+					relation_context=rel_ctx
+				)
+				x, read_gates = self.global_read(
+					x,
+					g_new,
+					extra_features=deg_input,
+					relation_context=rel_ctx
+				)
 
 				# Store for analysis
 				if self.training:

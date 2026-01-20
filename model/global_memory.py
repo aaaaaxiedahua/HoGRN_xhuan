@@ -37,6 +37,7 @@ class GlobalWriteModule(nn.Module):
         super(GlobalWriteModule, self).__init__()
         self.dim = dim
         self.attention_type = attention_type
+        self.rel_proj = nn.Linear(dim, dim, bias=False)
 
         if attention_type == 'concat':
             # Concatenation attention: a^T [g || h_i]
@@ -59,7 +60,7 @@ class GlobalWriteModule(nn.Module):
 
         self.leaky_relu = nn.LeakyReLU(0.2)
 
-    def forward(self, global_memory, entity_embeds):
+    def forward(self, global_memory, entity_embeds, relation_context=None):
         """
         Forward pass of global write module.
 
@@ -72,27 +73,33 @@ class GlobalWriteModule(nn.Module):
             attention_weights: Tensor (N,) - Contribution weight of each entity
         """
         N, d = entity_embeds.shape
+        h_for_attn = entity_embeds
+        if relation_context is not None:
+            if relation_context.dim() == 1:
+                relation_context = relation_context.unsqueeze(0)
+            rel_bias = self.rel_proj(relation_context)  # (1, d)
+            h_for_attn = entity_embeds + rel_bias
 
         if self.attention_type == 'concat':
             # Expand global memory: (1, d) -> (N, d)
             g_expanded = global_memory.expand(N, d)
 
             # Concatenate: (N, 2d)
-            concat = torch.cat([g_expanded, entity_embeds], dim=1)
+            concat = torch.cat([g_expanded, h_for_attn], dim=1)
 
             # Compute attention scores: (N, 1)
             e = self.leaky_relu(torch.matmul(concat, self.attention_vec))
 
         elif self.attention_type == 'dot':
             # Dot-product attention: g^T h_i
-            e = torch.matmul(entity_embeds, global_memory.t())  # (N, 1)
+            e = torch.matmul(h_for_attn, global_memory.t())  # (N, 1)
             e = e / np.sqrt(d)  # Scaling for numerical stability
 
         elif self.attention_type == 'additive':
             # Additive attention
             g_expanded = global_memory.expand(N, d)
             e = self.leaky_relu(
-                self.W_g(g_expanded) + self.W_h(entity_embeds)
+                self.W_g(g_expanded) + self.W_h(h_for_attn)
             )  # (N, d)
             e = torch.matmul(e, self.v)  # (N, 1)
 
@@ -133,6 +140,7 @@ class GlobalReadModule(nn.Module):
         self.use_residual = use_residual
         self.extra_input_dim = extra_input_dim
         input_dim = 2 * dim + extra_input_dim
+        self.rel_proj = nn.Linear(dim, dim, bias=False)
 
         if gate_type == 'mlp':
             # Two-layer MLP gate network
@@ -159,7 +167,7 @@ class GlobalReadModule(nn.Module):
         else:
             raise ValueError(f"Unknown gate_type: {gate_type}")
 
-    def forward(self, entity_embeds, global_memory, extra_features=None):
+    def forward(self, entity_embeds, global_memory, extra_features=None, relation_context=None):
         """
         Forward pass of global read module.
 
@@ -176,8 +184,15 @@ class GlobalReadModule(nn.Module):
         # Expand global memory: (1, d) -> (N, d)
         g_expanded = global_memory.expand(N, d)
 
+        entity_for_gate = entity_embeds
+        if relation_context is not None:
+            if relation_context.dim() == 1:
+                relation_context = relation_context.unsqueeze(0)
+            rel_bias = self.rel_proj(relation_context)  # (1, d)
+            entity_for_gate = entity_embeds + rel_bias
+
         # Concatenate features: (N, 2d [+ extra])
-        concat = torch.cat([entity_embeds, g_expanded], dim=1)
+        concat = torch.cat([entity_for_gate, g_expanded], dim=1)
         if extra_features is None and self.extra_input_dim > 0:
             extra_features = entity_embeds.new_zeros((N, self.extra_input_dim))
         if extra_features is not None:
@@ -253,7 +268,7 @@ class MultiHeadGlobalMemory(nn.Module):
         # Output projection
         self.output_proj = nn.Linear(dim, dim)
 
-    def forward(self, entity_embeds, extra_features=None):
+    def forward(self, entity_embeds, extra_features=None, relation_context=None):
         """
         Forward pass of multi-head global memory.
 
@@ -271,6 +286,11 @@ class MultiHeadGlobalMemory(nn.Module):
 
         enhanced_heads = []
         all_betas = []
+        rel_ctx_split = None
+        if relation_context is not None:
+            if relation_context.dim() == 1:
+                relation_context = relation_context.unsqueeze(0)
+            rel_ctx_split = relation_context.view(1, self.num_heads, self.head_dim)
 
         for i in range(self.num_heads):
             # Entity embeddings for head i: (N, head_dim)
@@ -280,8 +300,9 @@ class MultiHeadGlobalMemory(nn.Module):
             g_i = self.global_memories[i:i+1, :]
 
             # Write-Read cycle
-            g_new, _ = self.write_modules[i](g_i, h_i)
-            h_enhanced, beta = self.read_modules[i](h_i, g_new, extra_features=extra_features)
+            rel_ctx_i = rel_ctx_split[:, i, :] if rel_ctx_split is not None else None
+            g_new, _ = self.write_modules[i](g_i, h_i, relation_context=rel_ctx_i)
+            h_enhanced, beta = self.read_modules[i](h_i, g_new, extra_features=extra_features, relation_context=rel_ctx_i)
 
             enhanced_heads.append(h_enhanced)
             all_betas.append(beta)
