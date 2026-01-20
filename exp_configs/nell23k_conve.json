@@ -8,7 +8,7 @@
   "gcn_dim": 100,
   "embed_dim": 100,
   "gcn_layer": 1,
-  "gcn_drop": 0.2,
+  "gcn_drop": 0.1,
   "score_func": "conve",
   "chan_drop": 0.1,
   "rel_mask": 0.1,
@@ -20,5 +20,7 @@
   "global_attention_type": "dot",
   "global_gate_type": "mlp",
   "global_use_residual": true,
-  "global_memory_heads": 1
+  "global_memory_heads": 1,
+  "_comment_vc": "VC-HoGRN parameters",
+  "use_virtual_centroid": true
 }

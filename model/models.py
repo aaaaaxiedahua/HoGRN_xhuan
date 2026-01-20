@@ -1,4 +1,5 @@
 from re import X
+import torch.nn as nn
 from helper import *
 from model.hogrn_conv import HoGRNConv
 
@@ -70,6 +71,17 @@ class HoGRNBase(BaseModel):
 			# For storing intermediate values for analysis
 			self.last_write_attention = None
 			self.last_read_gates = None
+		# ===== VC-HoGRN: Virtual Centroid Enhancement =====
+		if hasattr(self.p, 'use_virtual_centroid') and self.p.use_virtual_centroid:
+			vc_dim = self.p.gcn_dim
+			self.vc_gate = nn.Sequential(
+				nn.Linear(vc_dim * 2 + 1, vc_dim),
+				nn.ReLU(),
+				nn.Dropout(0.1),
+				nn.Linear(vc_dim, 1),
+				nn.Sigmoid()
+			)
+			self.last_vc_gates = None
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -82,6 +94,40 @@ class HoGRNBase(BaseModel):
 		deg = scatter_add(edge_weight, row, dim=0, dim_size=self.p.num_ent)
 		deg = torch.log1p(deg)
 		return deg / (deg.max() + 1e-12)
+
+	def _apply_virtual_centroid(self, x, edge_index, edge_type):
+		num_edges = edge_index.size(1) // 2
+		fwd_index = edge_index[:, :num_edges]
+		fwd_type = edge_type[:num_edges]
+
+		tails = fwd_index[1]
+		rel_sum = scatter_add(x[tails], fwd_type, dim=0, dim_size=self.p.num_rel)
+		rel_cnt = scatter_add(
+			torch.ones_like(fwd_type, dtype=torch.float).unsqueeze(1),
+			fwd_type,
+			dim=0,
+			dim_size=self.p.num_rel
+		)
+		rel_centroid = rel_sum / (rel_cnt + 1e-12)
+
+		head = fwd_index[0]
+		head_rel = rel_centroid[fwd_type]
+		head_sum = scatter_add(head_rel, head, dim=0, dim_size=self.p.num_ent)
+		head_cnt = scatter_add(
+			torch.ones_like(head, dtype=torch.float).unsqueeze(1),
+			head,
+			dim=0,
+			dim_size=self.p.num_ent
+		)
+		proto = head_sum / (head_cnt + 1e-12)
+
+		deg_input = self.node_deg.unsqueeze(1)
+		gate_inp = torch.cat([x, proto, deg_input], dim=1)
+		beta = self.vc_gate(gate_inp)
+		has_rel = (head_cnt > 0).float()
+		beta = beta * has_rel
+		x = (1 - beta) * x + beta * proto
+		return x, beta.squeeze(1)
 
 	def _cul_cor(self, rel):
 		if self.p.rel_drop > 0:
@@ -115,6 +161,12 @@ class HoGRNBase(BaseModel):
 		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
 		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
 		x	= drop1(x)
+
+		# ===== VC-HoGRN: Virtual Centroid Enhancement =====
+		if hasattr(self.p, 'use_virtual_centroid') and self.p.use_virtual_centroid:
+			x, vc_gates = self._apply_virtual_centroid(x, edge_index, edge_type)
+			if self.training:
+				self.last_vc_gates = vc_gates
 
 		# ===== GloMem-HoGRN: Global Memory Enhancement =====
 		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
