@@ -36,7 +36,9 @@ class HoGRNBase(BaseModel):
 		self.conv4 = HoGRNConv(self.p.gcn_dim,    self.p.embed_dim,    num_rel, act=self.act, params=self.p) if self.p.gcn_layer >= 4 else None
 
 		self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
-		self.register_buffer('node_deg', self._compute_node_degree())
+		raw_deg, norm_deg = self._compute_node_degree()
+		self.register_buffer('node_deg', norm_deg)
+		self.register_buffer('node_deg_raw', raw_deg)
 
 		# ===== GloMem-HoGRN: Global Memory Enhancement =====
 		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
@@ -91,40 +93,60 @@ class HoGRNBase(BaseModel):
 	def _compute_node_degree(self):
 		row = self.edge_index[0]
 		edge_weight = torch.ones_like(row, dtype=torch.float)
-		deg = scatter_add(edge_weight, row, dim=0, dim_size=self.p.num_ent)
-		deg = torch.log1p(deg)
-		return deg / (deg.max() + 1e-12)
+		raw_deg = scatter_add(edge_weight, row, dim=0, dim_size=self.p.num_ent)
+		norm_deg = torch.log1p(raw_deg)
+		norm_deg = norm_deg / (norm_deg.max() + 1e-12)
+		return raw_deg, norm_deg
 
 	def _apply_virtual_centroid(self, x, edge_index, edge_type):
 		num_edges = edge_index.size(1) // 2
 		fwd_index = edge_index[:, :num_edges]
 		fwd_type = edge_type[:num_edges]
 
+		heads = fwd_index[0]
 		tails = fwd_index[1]
-		rel_sum = scatter_add(x[tails], fwd_type, dim=0, dim_size=self.p.num_rel)
+
+		rel_tail_sum = scatter_add(x[tails], fwd_type, dim=0, dim_size=self.p.num_rel)
 		rel_cnt = scatter_add(
 			torch.ones_like(fwd_type, dtype=torch.float).unsqueeze(1),
 			fwd_type,
 			dim=0,
 			dim_size=self.p.num_rel
 		)
-		rel_centroid = rel_sum / (rel_cnt + 1e-12)
+		rel_tail_centroid = rel_tail_sum / (rel_cnt + 1e-12)
 
-		head = fwd_index[0]
-		head_rel = rel_centroid[fwd_type]
-		head_sum = scatter_add(head_rel, head, dim=0, dim_size=self.p.num_ent)
+		rel_head_sum = scatter_add(x[heads], fwd_type, dim=0, dim_size=self.p.num_rel)
+		rel_head_centroid = rel_head_sum / (rel_cnt + 1e-12)
+
+		head_rel = rel_tail_centroid[fwd_type]
+		head_sum = scatter_add(head_rel, heads, dim=0, dim_size=self.p.num_ent)
 		head_cnt = scatter_add(
-			torch.ones_like(head, dtype=torch.float).unsqueeze(1),
-			head,
+			torch.ones_like(heads, dtype=torch.float).unsqueeze(1),
+			heads,
 			dim=0,
 			dim_size=self.p.num_ent
 		)
-		proto = head_sum / (head_cnt + 1e-12)
+
+		tail_rel = rel_head_centroid[fwd_type]
+		tail_sum = scatter_add(tail_rel, tails, dim=0, dim_size=self.p.num_ent)
+		tail_cnt = scatter_add(
+			torch.ones_like(tails, dtype=torch.float).unsqueeze(1),
+			tails,
+			dim=0,
+			dim_size=self.p.num_ent
+		)
+
+		proto_head = head_sum / (head_cnt + 1e-12)
+		proto_tail = tail_sum / (tail_cnt + 1e-12)
+		cnt_flags = (head_cnt > 0).float() + (tail_cnt > 0).float()
+		proto = (proto_head + proto_tail) / cnt_flags.clamp(min=1.0)
 
 		deg_input = self.node_deg.unsqueeze(1)
 		gate_inp = torch.cat([x, proto, deg_input], dim=1)
 		beta = self.vc_gate(gate_inp)
-		has_rel = (head_cnt > 0).float()
+		has_rel = (cnt_flags > 0).float()
+		deg_mask = (self.node_deg_raw <= getattr(self.p, 'vc_degree_threshold', 5)).float().unsqueeze(1)
+		beta = beta * deg_mask
 		beta = beta * has_rel
 		x = (1 - beta) * x + beta * proto
 		return x, beta.squeeze(1)

@@ -22,5 +22,6 @@
   "global_use_residual": true,
   "global_memory_heads": 1,
   "_comment_vc": "VC-HoGRN parameters",
-  "use_virtual_centroid": true
+  "use_virtual_centroid": true,
+  "vc_degree_threshold": 5
 }

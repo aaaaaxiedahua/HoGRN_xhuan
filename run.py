@@ -390,6 +390,7 @@ if __name__ == '__main__':
 	parser.add_argument('-global_memory_heads', dest='global_memory_heads', type=int, default=1, help='Number of global memory heads (1 for single, >1 for multi-head)')
 	# VC-HoGRN specific hyperparameters
 	parser.add_argument('-use_virtual_centroid', dest='use_virtual_centroid', action='store_true', help='Whether to use relation centroid enhancement')
+	parser.add_argument('-vc_degree_threshold', dest='vc_degree_threshold', type=int, default=5, help='Degree threshold for applying virtual centroid enhancement')
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
