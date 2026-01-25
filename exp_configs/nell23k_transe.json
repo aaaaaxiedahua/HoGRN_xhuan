@@ -12,12 +12,5 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "hid_drop": 0.2,
-  "sim_decay": 1e-05,
-
-  "_comment_glomem": "GloMem-HoGRN parameters for NELL23K (extremely sparse dataset)",
-  "use_global_memory": true,
-  "global_attention_type": "concat",
-  "global_gate_type": "mlp",
-  "global_use_residual": false,
-  "global_memory_heads": 1
+  "sim_decay": 1e-05
 }

@@ -382,16 +382,6 @@ if __name__ == '__main__':
 	parser.add_argument('-num_filt',  	dest='num_filt', 	default=32,   	type=int, 	help='ConvE: Number of filters in convolution')
 	parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=3,   	type=int, 	help='ConvE: Kernel size to use')
 
-	# GloMem-HoGRN specific hyperparameters
-	parser.add_argument('-use_global_memory', dest='use_global_memory', action='store_true', help='Whether to use global memory enhancement')
-	parser.add_argument('-global_attention_type', dest='global_attention_type', default='concat', choices=['concat', 'dot', 'additive'], help='Attention type for global write module')
-	parser.add_argument('-global_gate_type', dest='global_gate_type', default='mlp', choices=['mlp', 'linear', 'highway'], help='Gate type for global read module')
-	parser.add_argument('-global_use_residual', dest='global_use_residual', action='store_true', help='Whether to use residual connection in global read')
-	parser.add_argument('-global_memory_heads', dest='global_memory_heads', type=int, default=1, help='Number of global memory heads (1 for single, >1 for multi-head)')
-	# VC-HoGRN specific hyperparameters
-	parser.add_argument('-use_virtual_centroid', dest='use_virtual_centroid', action='store_true', help='Whether to use relation centroid enhancement')
-	parser.add_argument('-vc_degree_threshold', dest='vc_degree_threshold', type=int, default=5, help='Degree threshold for applying virtual centroid enhancement')
-
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
 	args = parser.parse_args()

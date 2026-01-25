@@ -40,51 +40,6 @@ class HoGRNBase(BaseModel):
 		self.register_buffer('node_deg', norm_deg)
 		self.register_buffer('node_deg_raw', raw_deg)
 
-		# ===== GloMem-HoGRN: Global Memory Enhancement =====
-		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
-			from model.global_memory import GlobalWriteModule, GlobalReadModule, MultiHeadGlobalMemory
-			mem_dim = self.p.gcn_dim
-
-			if hasattr(self.p, 'global_memory_heads') and self.p.global_memory_heads > 1:
-				# Multi-head global memory
-				self.global_memory_module = MultiHeadGlobalMemory(
-					dim=mem_dim,
-					num_heads=self.p.global_memory_heads,
-					attention_type=getattr(self.p, 'global_attention_type', 'concat'),
-					gate_type=getattr(self.p, 'global_gate_type', 'mlp'),
-					extra_input_dim=1
-				)
-				print(f"[GloMem] Multi-head mode enabled with {self.p.global_memory_heads} heads")
-			else:
-				# Single global memory
-				self.global_memory = get_param((1, mem_dim))
-				self.global_write = GlobalWriteModule(
-					dim=mem_dim,
-					attention_type=getattr(self.p, 'global_attention_type', 'concat')
-				)
-				self.global_read = GlobalReadModule(
-					dim=mem_dim,
-					gate_type=getattr(self.p, 'global_gate_type', 'mlp'),
-					use_residual=getattr(self.p, 'global_use_residual', False),
-					extra_input_dim=1
-				)
-				print(f"[GloMem] Single-head mode enabled")
-
-			# For storing intermediate values for analysis
-			self.last_write_attention = None
-			self.last_read_gates = None
-		# ===== VC-HoGRN: Virtual Centroid Enhancement =====
-		if hasattr(self.p, 'use_virtual_centroid') and self.p.use_virtual_centroid:
-			vc_dim = self.p.gcn_dim
-			self.vc_gate = nn.Sequential(
-				nn.Linear(vc_dim * 2 + 1, vc_dim),
-				nn.ReLU(),
-				nn.Dropout(0.1),
-				nn.Linear(vc_dim, 1),
-				nn.Sigmoid()
-			)
-			self.last_vc_gates = None
-
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
 		random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
@@ -97,59 +52,6 @@ class HoGRNBase(BaseModel):
 		norm_deg = torch.log1p(raw_deg)
 		norm_deg = norm_deg / (norm_deg.max() + 1e-12)
 		return raw_deg, norm_deg
-
-	def _apply_virtual_centroid(self, x, edge_index, edge_type):
-		num_edges = edge_index.size(1) // 2
-		fwd_index = edge_index[:, :num_edges]
-		fwd_type = edge_type[:num_edges]
-
-		heads = fwd_index[0]
-		tails = fwd_index[1]
-
-		rel_tail_sum = scatter_add(x[tails], fwd_type, dim=0, dim_size=self.p.num_rel)
-		rel_cnt = scatter_add(
-			torch.ones_like(fwd_type, dtype=torch.float).unsqueeze(1),
-			fwd_type,
-			dim=0,
-			dim_size=self.p.num_rel
-		)
-		rel_tail_centroid = rel_tail_sum / (rel_cnt + 1e-12)
-
-		rel_head_sum = scatter_add(x[heads], fwd_type, dim=0, dim_size=self.p.num_rel)
-		rel_head_centroid = rel_head_sum / (rel_cnt + 1e-12)
-
-		head_rel = rel_tail_centroid[fwd_type]
-		head_sum = scatter_add(head_rel, heads, dim=0, dim_size=self.p.num_ent)
-		head_cnt = scatter_add(
-			torch.ones_like(heads, dtype=torch.float).unsqueeze(1),
-			heads,
-			dim=0,
-			dim_size=self.p.num_ent
-		)
-
-		tail_rel = rel_head_centroid[fwd_type]
-		tail_sum = scatter_add(tail_rel, tails, dim=0, dim_size=self.p.num_ent)
-		tail_cnt = scatter_add(
-			torch.ones_like(tails, dtype=torch.float).unsqueeze(1),
-			tails,
-			dim=0,
-			dim_size=self.p.num_ent
-		)
-
-		proto_head = head_sum / (head_cnt + 1e-12)
-		proto_tail = tail_sum / (tail_cnt + 1e-12)
-		cnt_flags = (head_cnt > 0).float() + (tail_cnt > 0).float()
-		proto = (proto_head + proto_tail) / cnt_flags.clamp(min=1.0)
-
-		deg_input = self.node_deg.unsqueeze(1)
-		gate_inp = torch.cat([x, proto, deg_input], dim=1)
-		beta = self.vc_gate(gate_inp)
-		has_rel = (cnt_flags > 0).float()
-		deg_mask = (self.node_deg_raw <= getattr(self.p, 'vc_degree_threshold', 5)).float().unsqueeze(1)
-		beta = beta * deg_mask
-		beta = beta * has_rel
-		x = (1 - beta) * x + beta * proto
-		return x, beta.squeeze(1)
 
 	def _cul_cor(self, rel):
 		if self.p.rel_drop > 0:
@@ -184,41 +86,6 @@ class HoGRNBase(BaseModel):
 		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
 		x	= drop1(x)
 
-		# ===== VC-HoGRN: Virtual Centroid Enhancement =====
-		if hasattr(self.p, 'use_virtual_centroid') and self.p.use_virtual_centroid:
-			x, vc_gates = self._apply_virtual_centroid(x, edge_index, edge_type)
-			if self.training:
-				self.last_vc_gates = vc_gates
-
-		# ===== GloMem-HoGRN: Global Memory Enhancement =====
-		if hasattr(self.p, 'use_global_memory') and self.p.use_global_memory:
-			deg_input = self.node_deg.unsqueeze(1)
-			rel_ctx = torch.index_select(r, 0, rel).mean(dim=0, keepdim=True)
-			if hasattr(self, 'global_memory_module'):
-				# Multi-head global memory
-				x, read_gates = self.global_memory_module(
-					x,
-					extra_features=deg_input,
-					relation_context=rel_ctx
-				)
-			else:
-				# Single global memory: Write-Read cycle
-				g_new, write_attention = self.global_write(
-					self.global_memory,
-					x,
-					relation_context=rel_ctx
-				)
-				x, read_gates = self.global_read(
-					x,
-					g_new,
-					extra_features=deg_input,
-					relation_context=rel_ctx
-				)
-
-				# Store for analysis
-				if self.training:
-					self.last_write_attention = write_attention
-					self.last_read_gates = read_gates
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 2 else (x, r)
 		x	= drop2(x) 							if self.p.gcn_layer >= 2 else x
 		x, r	= self.conv3(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 3 else (x, r)
