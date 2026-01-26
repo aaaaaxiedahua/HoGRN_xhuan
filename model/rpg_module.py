@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add
+from torch_sparse import SparseTensor, matmul
 
 
 class PathEncoder(nn.Module):
@@ -98,6 +99,10 @@ class PathGuidedAggregator(nn.Module):
 
         # Adjacency dict will be built from edge_index
         self.adj_by_rel = None
+        # Sparse matrices for GPU acceleration
+        self.path_matrices = None
+        self.sparse_mask = None
+        self.num_ent = None
 
     def build_adjacency(self, edge_index, edge_type, num_ent):
         """Build adjacency dict grouped by relation type."""
@@ -116,6 +121,92 @@ class PathGuidedAggregator(nn.Module):
             self.adj_by_rel[r][h].append(t)
 
         print(f"[RPG-Aggregator] Adjacency built: {len(self.adj_by_rel)} relation types")
+
+    def build_relation_matrices(self, edge_index, edge_type, num_ent, device):
+        """Build sparse adjacency matrix for each relation."""
+        print(f"[RPG-Aggregator] Building relation matrices...")
+        self.rel_matrices = {}
+
+        for r in range(self.num_relations * 2):
+            mask = (edge_type == r)
+            if mask.sum() == 0:
+                continue
+            r_edge = edge_index[:, mask]
+            row, col = r_edge[0], r_edge[1]
+            val = torch.ones(row.size(0), device=device)
+            self.rel_matrices[r] = SparseTensor(
+                row=row, col=col, value=val,
+                sparse_sizes=(num_ent, num_ent)
+            )
+
+        print(f"[RPG-Aggregator] Built {len(self.rel_matrices)} relation matrices")
+
+    def build_path_matrices(self, node_degrees, num_ent, device):
+        """Build combined path matrix for sparse nodes (precompute once)."""
+        print(f"[RPG-Aggregator] Building path matrices...")
+
+        # Get sparse node mask
+        self.sparse_mask = (node_degrees <= self.sparse_threshold)
+        sparse_count = self.sparse_mask.sum().item()
+
+        # Collect all path edges
+        all_rows, all_cols = [], []
+        path_count = 0
+
+        for path, freq in self.frequent_paths.items():
+            if path_count >= len(self.frequent_paths):
+                break
+
+            # Compute path matrix: A_r1 @ A_r2 @ ...
+            if path[0] not in self.rel_matrices:
+                continue
+
+            path_mat = self.rel_matrices[path[0]]
+            valid = True
+
+            for r in path[1:]:
+                if r not in self.rel_matrices:
+                    valid = False
+                    break
+                path_mat = path_mat @ self.rel_matrices[r]
+
+            if not valid:
+                continue
+
+            # Extract edges from path matrix
+            row, col, _ = path_mat.coo()
+            all_rows.append(row)
+            all_cols.append(col)
+            path_count += 1
+
+        if all_rows:
+            # Combine all path edges
+            all_rows = torch.cat(all_rows)
+            all_cols = torch.cat(all_cols)
+
+            # Remove duplicates
+            edge_hash = all_rows * num_ent + all_cols
+            unique_hash, inverse = torch.unique(edge_hash, return_inverse=True)
+            unique_rows = unique_hash // num_ent
+            unique_cols = unique_hash % num_ent
+
+            # Build combined sparse matrix
+            val = torch.ones(unique_rows.size(0), device=device)
+            self.path_matrices = SparseTensor(
+                row=unique_rows, col=unique_cols, value=val,
+                sparse_sizes=(num_ent, num_ent)
+            )
+
+            # Count edges per node for normalization
+            self.node_edge_count = scatter_add(
+                val, unique_rows, dim=0, dim_size=num_ent
+            )
+            self.node_edge_count = self.node_edge_count.clamp(min=1)
+
+            print(f"[RPG-Aggregator] Path matrix: {unique_rows.size(0)} edges, "
+                  f"{sparse_count} sparse nodes")
+        else:
+            print(f"[RPG-Aggregator] Warning: No valid path matrices built")
 
     def get_path_endpoints(self, start_nodes, path):
         """
@@ -143,74 +234,39 @@ class PathGuidedAggregator(nn.Module):
 
     def forward(self, entity_embeds, node_degrees, edge_index, edge_type):
         """
-        Path-guided aggregation for sparse nodes.
-
-        Args:
-            entity_embeds: [N, dim] entity embeddings
-            node_degrees: [N] node degree tensor
-            edge_index: [2, E] edge index
-            edge_type: [E] edge types
-
-        Returns:
-            remote_features: [N, dim] aggregated remote features
+        Path-guided aggregation using sparse matrix multiplication (GPU).
         """
         N, dim = entity_embeds.shape
         device = entity_embeds.device
+        self.num_ent = N
 
-        # Build adjacency if not done
-        if self.adj_by_rel is None:
-            self.build_adjacency(edge_index, edge_type, N)
+        # Build matrices on first call (precompute once)
+        if self.path_matrices is None:
+            self.build_relation_matrices(edge_index, edge_type, N, device)
+            self.build_path_matrices(node_degrees, N, device)
 
-        # Initialize output
-        remote_features = torch.zeros_like(entity_embeds)
-        remote_counts = torch.zeros(N, 1, device=device)
+        # If no valid paths, return zeros
+        if self.path_matrices is None:
+            return torch.zeros_like(entity_embeds)
 
-        # Find sparse nodes
+        # GPU sparse matrix multiplication: aggregate remote features
+        # remote_features[i] = sum of entity_embeds[j] for all j reachable from i
+        remote_features = matmul(self.path_matrices, entity_embeds)
+
+        # Normalize by edge count
+        remote_features = remote_features / self.node_edge_count.unsqueeze(1)
+
+        # Only keep features for sparse nodes
         sparse_mask = (node_degrees <= self.sparse_threshold)
-        sparse_nodes = torch.where(sparse_mask)[0].cpu().tolist()
+        remote_features = remote_features * sparse_mask.float().unsqueeze(1)
 
-        if not sparse_nodes or not self.rel_to_paths:
-            return remote_features
-
-        # Process each sparse node
-        enhanced_count = 0
-        for node_id in sparse_nodes:
-            node_features = []
-
-            # Get relations connected to this node
-            for rel, paths_list in self.rel_to_paths.items():
-                # Use top-k paths for this relation
-                for path, count in paths_list[:self.top_k_paths]:
-                    endpoints = self.get_path_endpoints({node_id}, path)
-
-                    if endpoints:
-                        # Aggregate endpoint features
-                        endpoint_ids = list(endpoints)
-                        endpoint_embeds = entity_embeds[endpoint_ids]
-                        agg_embed = endpoint_embeds.mean(dim=0)
-
-                        # Compute path weight
-                        weight = self.path_weight_net(agg_embed)
-                        node_features.append(weight * agg_embed)
-
-            if node_features:
-                # Average all path features
-                remote_features[node_id] = torch.stack(node_features).mean(dim=0)
-                remote_counts[node_id] = 1.0
-                enhanced_count += 1
-
-        # Log statistics periodically
+        # Log statistics
         self.forward_count += 1
-        self.total_sparse_nodes += len(sparse_nodes)
-        self.total_enhanced_nodes += enhanced_count
-
         if self.forward_count % self.log_interval == 0:
-            avg_sparse = self.total_sparse_nodes / self.forward_count
-            avg_enhanced = self.total_enhanced_nodes / self.forward_count
-            enhance_ratio = avg_enhanced / (avg_sparse + 1e-6) * 100
+            sparse_count = sparse_mask.sum().item()
+            enhanced = (remote_features.abs().sum(dim=1) > 0).sum().item()
             print(f"[RPG-Aggregator] Step {self.forward_count}: "
-                  f"avg_sparse={avg_sparse:.1f}, avg_enhanced={avg_enhanced:.1f}, "
-                  f"enhance_ratio={enhance_ratio:.1f}%")
+                  f"sparse={sparse_count}, enhanced={enhanced}")
 
         return remote_features
 
