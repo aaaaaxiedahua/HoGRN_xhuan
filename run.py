@@ -92,6 +92,28 @@ class Runner(object):
 
 		self.edge_index, self.edge_type = self.construct_adj()
 
+		# ===== RPG-HoGRN: Mine relation paths =====
+		if hasattr(self.p, 'use_rpg') and self.p.use_rpg:
+			from model.path_mining import mine_and_save_paths, load_paths
+			path_dir = f'./data/{self.p.dataset}/paths'
+
+			# Try to load existing paths
+			frequent_paths, rel_to_paths = load_paths(path_dir)
+
+			if frequent_paths is None:
+				# Mine new paths
+				frequent_paths, rel_to_paths = mine_and_save_paths(
+					triples=self.data['train'],
+					num_relations=self.p.num_rel,
+					save_dir=path_dir,
+					max_length=getattr(self.p, 'rpg_max_path_length', 3),
+					min_count=getattr(self.p, 'rpg_min_path_count', 50)
+				)
+
+			# Store in params for model
+			self.p.frequent_paths = frequent_paths
+			self.p.rel_to_paths = rel_to_paths
+
 	def construct_adj(self):
 		"""
 		Construct the adjacency matrix for GCN.
@@ -381,6 +403,14 @@ if __name__ == '__main__':
 	parser.add_argument('-k_h',	  		dest='k_h', 		default=10,   	type=int, 	help='ConvE: k_h')
 	parser.add_argument('-num_filt',  	dest='num_filt', 	default=32,   	type=int, 	help='ConvE: Number of filters in convolution')
 	parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=3,   	type=int, 	help='ConvE: Kernel size to use')
+
+	# RPG-HoGRN specific hyperparameters
+	parser.add_argument('-use_rpg', dest='use_rpg', action='store_true', help='Whether to use relation path guided enhancement')
+	parser.add_argument('-rpg_max_path_length', dest='rpg_max_path_length', type=int, default=3, help='RPG: Maximum path length')
+	parser.add_argument('-rpg_min_path_count', dest='rpg_min_path_count', type=int, default=50, help='RPG: Minimum path frequency')
+	parser.add_argument('-rpg_top_k_paths', dest='rpg_top_k_paths', type=int, default=5, help='RPG: Top-k paths per relation')
+	parser.add_argument('-rpg_sparse_threshold', dest='rpg_sparse_threshold', type=int, default=5, help='RPG: Degree threshold for sparse nodes')
+	parser.add_argument('-rpg_fusion_dropout', dest='rpg_fusion_dropout', type=float, default=0.1, help='RPG: Fusion dropout')
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')

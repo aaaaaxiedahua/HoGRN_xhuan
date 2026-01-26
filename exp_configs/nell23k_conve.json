@@ -13,5 +13,13 @@
   "chan_drop": 0.1,
   "rel_mask": 0.1,
   "rel_norm": true,
-  "hid_drop": 0.3
+  "hid_drop": 0.3,
+
+  "_comment_rpg": "RPG-HoGRN: Relation Path Guided Enhancement",
+  "use_rpg": true,
+  "rpg_max_path_length": 2,
+  "rpg_min_path_count": 30,
+  "rpg_top_k_paths": 3,
+  "rpg_sparse_threshold": 5,
+  "rpg_fusion_dropout": 0.1
 }
