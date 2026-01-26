@@ -316,8 +316,8 @@ class AdaptiveFusion(nn.Module):
         # Compute fusion weight
         beta = self.gate(gate_input)
 
-        # Fuse: sparse nodes rely more on remote features
-        h_fused = (1 - beta) * h_local + beta * h_remote
+        # Residual fusion: preserve local features, add weighted remote features
+        h_fused = h_local + beta * h_remote
 
         # Log statistics periodically
         self.forward_count += 1
