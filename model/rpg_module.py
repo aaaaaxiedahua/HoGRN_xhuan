@@ -8,7 +8,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add
-from torch_sparse import SparseTensor, matmul
 
 
 class PathEncoder(nn.Module):
@@ -123,7 +122,7 @@ class PathGuidedAggregator(nn.Module):
         print(f"[RPG-Aggregator] Adjacency built: {len(self.adj_by_rel)} relation types")
 
     def build_relation_matrices(self, edge_index, edge_type, num_ent, device):
-        """Build sparse adjacency matrix for each relation."""
+        """Build sparse adjacency matrix for each relation using native PyTorch."""
         print(f"[RPG-Aggregator] Building relation matrices...")
         self.rel_matrices = {}
 
@@ -134,10 +133,11 @@ class PathGuidedAggregator(nn.Module):
             r_edge = edge_index[:, mask]
             row, col = r_edge[0], r_edge[1]
             val = torch.ones(row.size(0), device=device)
-            self.rel_matrices[r] = SparseTensor(
-                row=row, col=col, value=val,
-                sparse_sizes=(num_ent, num_ent)
-            )
+            # Use native PyTorch sparse tensor
+            indices = torch.stack([row, col], dim=0)
+            self.rel_matrices[r] = torch.sparse_coo_tensor(
+                indices, val, (num_ent, num_ent), device=device
+            ).coalesce()
 
         print(f"[RPG-Aggregator] Built {len(self.rel_matrices)} relation matrices")
 
@@ -154,9 +154,6 @@ class PathGuidedAggregator(nn.Module):
         path_count = 0
 
         for path, freq in self.frequent_paths.items():
-            if path_count >= len(self.frequent_paths):
-                break
-
             # Compute path matrix: A_r1 @ A_r2 @ ...
             if path[0] not in self.rel_matrices:
                 continue
@@ -168,16 +165,21 @@ class PathGuidedAggregator(nn.Module):
                 if r not in self.rel_matrices:
                     valid = False
                     break
-                path_mat = path_mat @ self.rel_matrices[r]
+                # Native PyTorch sparse matrix multiplication
+                path_mat = torch.sparse.mm(path_mat, self.rel_matrices[r])
 
             if not valid:
                 continue
 
-            # Extract edges from path matrix
-            row, col, _ = path_mat.coo()
+            # Extract edges from sparse COO tensor
+            path_mat = path_mat.coalesce()
+            indices = path_mat.indices()
+            row, col = indices[0], indices[1]
             all_rows.append(row)
             all_cols.append(col)
             path_count += 1
+
+        print(f"[RPG-Aggregator] Processed {path_count} paths")
 
         if all_rows:
             # Combine all path edges
@@ -190,12 +192,12 @@ class PathGuidedAggregator(nn.Module):
             unique_rows = unique_hash // num_ent
             unique_cols = unique_hash % num_ent
 
-            # Build combined sparse matrix
+            # Build combined sparse matrix using native PyTorch
             val = torch.ones(unique_rows.size(0), device=device)
-            self.path_matrices = SparseTensor(
-                row=unique_rows, col=unique_cols, value=val,
-                sparse_sizes=(num_ent, num_ent)
-            )
+            indices = torch.stack([unique_rows, unique_cols], dim=0)
+            self.path_matrices = torch.sparse_coo_tensor(
+                indices, val, (num_ent, num_ent), device=device
+            ).coalesce()
 
             # Count edges per node for normalization
             self.node_edge_count = scatter_add(
@@ -251,7 +253,7 @@ class PathGuidedAggregator(nn.Module):
 
         # GPU sparse matrix multiplication: aggregate remote features
         # remote_features[i] = sum of entity_embeds[j] for all j reachable from i
-        remote_features = matmul(self.path_matrices, entity_embeds)
+        remote_features = torch.sparse.mm(self.path_matrices, entity_embeds)
 
         # Normalize by edge count
         remote_features = remote_features / self.node_edge_count.unsqueeze(1)
