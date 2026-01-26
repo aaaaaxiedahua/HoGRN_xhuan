@@ -79,6 +79,15 @@ class PathGuidedAggregator(nn.Module):
         self.top_k_paths = top_k_paths
         self.sparse_threshold = sparse_threshold
 
+        # Log statistics
+        self.log_interval = 100
+        self.forward_count = 0
+        self.total_sparse_nodes = 0
+        self.total_enhanced_nodes = 0
+
+        print(f"[RPG-Aggregator] embed_dim={embed_dim}, top_k={top_k_paths}, sparse_threshold={sparse_threshold}")
+        print(f"[RPG-Aggregator] Loaded {len(frequent_paths)} paths, {len(rel_to_paths)} relations indexed")
+
         # Learnable path weights
         self.path_weight_net = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
@@ -92,6 +101,7 @@ class PathGuidedAggregator(nn.Module):
 
     def build_adjacency(self, edge_index, edge_type, num_ent):
         """Build adjacency dict grouped by relation type."""
+        print(f"[RPG-Aggregator] Building adjacency from {edge_index.shape[1]} edges...")
         self.adj_by_rel = {}
         edge_index_np = edge_index.cpu().numpy()
         edge_type_np = edge_type.cpu().numpy()
@@ -104,6 +114,8 @@ class PathGuidedAggregator(nn.Module):
             if h not in self.adj_by_rel[r]:
                 self.adj_by_rel[r][h] = []
             self.adj_by_rel[r][h].append(t)
+
+        print(f"[RPG-Aggregator] Adjacency built: {len(self.adj_by_rel)} relation types")
 
     def get_path_endpoints(self, start_nodes, path):
         """
@@ -161,6 +173,7 @@ class PathGuidedAggregator(nn.Module):
             return remote_features
 
         # Process each sparse node
+        enhanced_count = 0
         for node_id in sparse_nodes:
             node_features = []
 
@@ -184,6 +197,20 @@ class PathGuidedAggregator(nn.Module):
                 # Average all path features
                 remote_features[node_id] = torch.stack(node_features).mean(dim=0)
                 remote_counts[node_id] = 1.0
+                enhanced_count += 1
+
+        # Log statistics periodically
+        self.forward_count += 1
+        self.total_sparse_nodes += len(sparse_nodes)
+        self.total_enhanced_nodes += enhanced_count
+
+        if self.forward_count % self.log_interval == 0:
+            avg_sparse = self.total_sparse_nodes / self.forward_count
+            avg_enhanced = self.total_enhanced_nodes / self.forward_count
+            enhance_ratio = avg_enhanced / (avg_sparse + 1e-6) * 100
+            print(f"[RPG-Aggregator] Step {self.forward_count}: "
+                  f"avg_sparse={avg_sparse:.1f}, avg_enhanced={avg_enhanced:.1f}, "
+                  f"enhance_ratio={enhance_ratio:.1f}%")
 
         return remote_features
 
@@ -202,6 +229,13 @@ class AdaptiveFusion(nn.Module):
             nn.Linear(embed_dim, 1),
             nn.Sigmoid()
         )
+
+        # Log statistics
+        self.log_interval = 100
+        self.forward_count = 0
+        self.beta_sum = 0.0
+
+        print(f"[RPG-Fusion] embed_dim={embed_dim}, dropout={dropout}")
 
     def forward(self, h_local, h_remote, node_degrees):
         """
@@ -226,5 +260,13 @@ class AdaptiveFusion(nn.Module):
 
         # Fuse: sparse nodes rely more on remote features
         h_fused = (1 - beta) * h_local + beta * h_remote
+
+        # Log statistics periodically
+        self.forward_count += 1
+        self.beta_sum += beta.mean().item()
+
+        if self.forward_count % self.log_interval == 0:
+            avg_beta = self.beta_sum / self.forward_count
+            print(f"[RPG-Fusion] Step {self.forward_count}: avg_beta={avg_beta:.4f}")
 
         return h_fused, beta.squeeze(1)

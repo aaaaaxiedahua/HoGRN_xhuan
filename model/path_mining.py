@@ -25,6 +25,8 @@ class PathMiner:
         self.triples = triples
         self.num_relations = num_relations
 
+        print(f"[PathMiner] Initializing with {len(triples)} triples, {num_relations} relations")
+
         # Build adjacency list: entity -> [(relation, neighbor), ...]
         self.adj_out = defaultdict(list)  # outgoing edges
         self.adj_in = defaultdict(list)   # incoming edges (inverse)
@@ -32,6 +34,8 @@ class PathMiner:
         for h, r, t in triples:
             self.adj_out[h].append((r, t))
             self.adj_in[t].append((r, h))
+
+        print(f"[PathMiner] Built adjacency: {len(self.adj_out)} entities with outgoing edges")
 
     def mine_paths(self, max_length=3, min_count=50):
         """
@@ -45,17 +49,24 @@ class PathMiner:
             path_count: Dict[(r1, r2, ...), count]
         """
         path_count = defaultdict(int)
+        path_2_count = 0
+        path_3_count = 0
 
         # Iterate all triples as starting point
         for h, r1, t1 in self.triples:
             # Length-2 paths: h -r1-> t1 -r2-> t2
             for r2, t2 in self.adj_out[t1]:
                 path_count[(r1, r2)] += 1
+                path_2_count += 1
 
                 # Length-3 paths: h -r1-> t1 -r2-> t2 -r3-> t3
                 if max_length >= 3:
                     for r3, t3 in self.adj_out[t2]:
                         path_count[(r1, r2, r3)] += 1
+                        path_3_count += 1
+
+        print(f"[PathMiner] Raw path instances: 2-hop={path_2_count}, 3-hop={path_3_count}")
+        print(f"[PathMiner] Unique path patterns before filtering: {len(path_count)}")
 
         # Filter by frequency
         frequent_paths = {
@@ -63,6 +74,17 @@ class PathMiner:
             for path, count in path_count.items()
             if count >= min_count
         }
+
+        # Statistics
+        path_2_filtered = sum(1 for p in frequent_paths if len(p) == 2)
+        path_3_filtered = sum(1 for p in frequent_paths if len(p) == 3)
+        print(f"[PathMiner] After filtering (min_count={min_count}): 2-hop={path_2_filtered}, 3-hop={path_3_filtered}")
+
+        # Show top-5 frequent paths
+        sorted_paths = sorted(frequent_paths.items(), key=lambda x: -x[1])[:5]
+        print(f"[PathMiner] Top-5 frequent paths:")
+        for path, count in sorted_paths:
+            print(f"  {path} -> {count} times")
 
         return frequent_paths
 
