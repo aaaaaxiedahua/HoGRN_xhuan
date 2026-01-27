@@ -43,32 +43,19 @@ class HoGRNBase(BaseModel):
 		self.register_buffer('node_deg', norm_deg)
 		self.register_buffer('node_deg_raw', raw_deg)
 
-		# ===== RPG-HoGRN: Relation Path Guided Enhancement =====
-		if hasattr(self.p, 'use_rpg') and self.p.use_rpg:
-			from model.rpg_module import PathGuidedAggregator, AdaptiveFusion
-			rpg_dim = self.p.gcn_dim
+		# ===== RPG-HoGRN: Path Score Enhancement (得分增强) =====
+		if hasattr(self.p, 'use_path_score') and self.p.use_path_score:
+			from model.rpg_module import PathScoreEnhancer
 
-			# Get pre-mined paths
 			frequent_paths = getattr(self.p, 'frequent_paths', {})
-			rel_to_paths = getattr(self.p, 'rel_to_paths', {})
 
-			self.path_aggregator = PathGuidedAggregator(
-				embed_dim=rpg_dim,
+			self.path_score_enhancer = PathScoreEnhancer(
+				embed_dim=self.p.embed_dim,
 				num_relations=num_rel,
 				frequent_paths=frequent_paths,
-				rel_to_paths=rel_to_paths,
-				top_k_paths=getattr(self.p, 'rpg_top_k_paths', 5),
-				sparse_threshold=getattr(self.p, 'rpg_sparse_threshold', 5)
+				top_k_paths=getattr(self.p, 'rpg_top_k_paths', 10)
 			)
-
-			self.rpg_fusion = AdaptiveFusion(
-				embed_dim=rpg_dim,
-				sparse_threshold=getattr(self.p, 'rpg_sparse_threshold', 5),
-				dropout=getattr(self.p, 'rpg_fusion_dropout', 0.1)
-			)
-
-			self.last_rpg_gates = None
-			logger.info(f"[RPG] Enabled with {len(frequent_paths)} paths")
+			logger.info(f"[RPG] Path score enhancement enabled with {len(frequent_paths)} paths")
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -115,14 +102,6 @@ class HoGRNBase(BaseModel):
 		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
 		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r)
 		x	= drop1(x)
-
-		# ===== RPG-HoGRN: Path-Guided Enhancement =====
-		if hasattr(self.p, 'use_rpg') and self.p.use_rpg:
-			# P3: 传递关系嵌入以支持查询感知注意力
-			h_remote = self.path_aggregator(x, self.node_deg_raw, edge_index, edge_type, rel_embed=r)
-			x, rpg_gates = self.rpg_fusion(x, h_remote, self.node_deg_raw)
-			if self.training:
-				self.last_rpg_gates = rpg_gates
 
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r) 	if self.p.gcn_layer >= 2 else (x, r)
 		x	= drop2(x) 							if self.p.gcn_layer >= 2 else x
@@ -214,6 +193,16 @@ class HoGRN_ConvE(HoGRNBase):
 
 		x 		= torch.mm(x, all_ent.transpose(1,0))
 		x 		+= self.bias.expand_as(x)
+
+		# ===== Path Score Enhancement (新方案) =====
+		if hasattr(self.p, 'use_path_score') and self.p.use_path_score:
+			x = self.path_score_enhancer(
+				original_score=x,
+				head_idx=sub,
+				rel_embed=rel_emb,
+				edge_index=self.edge_index,
+				edge_type=self.edge_type
+			)
 
 		score	= torch.sigmoid(x)
 		return score, cor
