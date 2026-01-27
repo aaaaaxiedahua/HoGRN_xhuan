@@ -115,7 +115,8 @@ class HoGRNBase(BaseModel):
 
 		# ===== RPG-HoGRN: Path-Guided Enhancement =====
 		if hasattr(self.p, 'use_rpg') and self.p.use_rpg:
-			h_remote = self.path_aggregator(x, self.node_deg_raw, edge_index, edge_type)
+			# P3: 传递关系嵌入以支持查询感知注意力
+			h_remote = self.path_aggregator(x, self.node_deg_raw, edge_index, edge_type, rel_embed=r)
 			x, rpg_gates = self.rpg_fusion(x, h_remote, self.node_deg_raw)
 			if self.training:
 				self.last_rpg_gates = rpg_gates

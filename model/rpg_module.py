@@ -5,6 +5,7 @@ RPG-HoGRN: Relation Path Guided Module (Refactored)
 1. P0: 软阈值替换硬截断
 2. P1: 简化 AdaptiveFusion
 3. P2: 分路径聚合 + 注意力加权
+4. P3: Query-Aware Path Attention (查询感知的路径注意力)
 """
 
 import torch
@@ -15,7 +16,11 @@ from torch_scatter import scatter_add
 
 class PathGuidedAggregator(nn.Module):
     """
-    Path-Guided Aggregator: 分路径聚合 + 注意力加权
+    Path-Guided Aggregator: 分路径聚合 + 查询感知注意力加权
+
+    P3改进：路径注意力权重同时考虑：
+    1. 路径聚合的特征质量（原有）
+    2. 查询关系与路径的语义相关性（新增）
     """
 
     def __init__(self, embed_dim, num_relations, frequent_paths, rel_to_paths,
@@ -31,12 +36,30 @@ class PathGuidedAggregator(nn.Module):
         # 软阈值的温度参数（可学习）
         self.temperature = nn.Parameter(torch.tensor(2.0))
 
-        # 路径注意力网络
+        # 路径注意力网络（基于特征质量）
         self.path_attention = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.Tanh(),
             nn.Linear(embed_dim // 2, 1)
         )
+
+        # ===== P3: Query-Aware Path Attention =====
+        # 关系嵌入（用于编码路径）
+        self.rel_embed = nn.Embedding(num_relations * 2, embed_dim)
+
+        # 路径编码器：将路径中的关系序列编码为向量
+        self.path_encoder = nn.GRU(
+            input_size=embed_dim,
+            hidden_size=embed_dim,
+            batch_first=True,
+            bidirectional=False
+        )
+
+        # 查询-路径相关性计算
+        self.query_path_bilinear = nn.Bilinear(embed_dim, embed_dim, 1)
+
+        # 融合权重：平衡特征注意力和查询相关性
+        self.query_weight = nn.Parameter(torch.tensor(0.5))
 
         # Log statistics
         self.log_interval = 100
@@ -44,9 +67,11 @@ class PathGuidedAggregator(nn.Module):
 
         print(f"[RPG-Aggregator] embed_dim={embed_dim}, top_k={top_k_paths}, sparse_threshold={sparse_threshold}")
         print(f"[RPG-Aggregator] Loaded {len(frequent_paths)} paths, {len(rel_to_paths)} relations indexed")
+        print(f"[RPG-Aggregator] P3 Query-Aware Attention enabled")
 
         # 分路径存储（不合并）
         self.path_matrices_list = None  # [(path_tuple, sparse_matrix, norm_vector), ...]
+        self.path_embeddings = None  # 预计算的路径嵌入 [num_paths, embed_dim]
         self.rel_matrices = None
         self.num_ent = None
 
@@ -134,9 +159,40 @@ class PathGuidedAggregator(nn.Module):
             for i, (path, _) in enumerate(self.path_matrices_list[:5]):
                 print(f"  Path {i}: {path}")
 
-    def forward(self, entity_embeds, node_degrees, edge_index, edge_type):
+        # ===== P3: 预计算路径嵌入 =====
+        self._build_path_embeddings(device)
+
+    def _build_path_embeddings(self, device):
+        """预计算每条路径的嵌入向量"""
+        if not self.path_matrices_list:
+            self.path_embeddings = None
+            return
+
+        path_embeds = []
+        for path, _ in self.path_matrices_list:
+            # 将路径中的关系ID转为tensor
+            path_tensor = torch.tensor(list(path), dtype=torch.long, device=device)
+            # 获取关系嵌入
+            rel_embeds = self.rel_embed(path_tensor)  # [path_len, embed_dim]
+            # 通过GRU编码
+            rel_embeds = rel_embeds.unsqueeze(0)  # [1, path_len, embed_dim]
+            _, h_n = self.path_encoder(rel_embeds)  # h_n: [1, 1, embed_dim]
+            path_embed = h_n.squeeze(0).squeeze(0)  # [embed_dim]
+            path_embeds.append(path_embed)
+
+        self.path_embeddings = torch.stack(path_embeds, dim=0)  # [num_paths, embed_dim]
+        print(f"[RPG-Aggregator] Built path embeddings: {self.path_embeddings.shape}")
+
+    def forward(self, entity_embeds, node_degrees, edge_index, edge_type, rel_embed=None):
         """
-        分路径聚合 + 注意力加权 + 软阈值
+        分路径聚合 + 查询感知注意力加权
+
+        Args:
+            entity_embeds: [N, dim] 实体嵌入
+            node_degrees: [N] 节点度数
+            edge_index: [2, E] 边索引
+            edge_type: [E] 边类型
+            rel_embed: [num_rel*2, dim] 关系嵌入（用于查询感知注意力）
         """
         N, dim = entity_embeds.shape
         device = entity_embeds.device
@@ -162,23 +218,52 @@ class PathGuidedAggregator(nn.Module):
         path_features = torch.stack(path_features, dim=1)
         num_paths = path_features.size(1)
 
-        # ===== 2. 注意力加权 =====
-        # 计算每条路径的注意力分数
-        attn_scores = self.path_attention(path_features)  # [N, num_paths, 1]
-        attn_weights = F.softmax(attn_scores, dim=1)  # [N, num_paths, 1]
+        # ===== 2. 特征质量注意力（原有）=====
+        feature_attn = self.path_attention(path_features)  # [N, num_paths, 1]
+
+        # ===== 3. P3: 查询感知注意力（新增）=====
+        if rel_embed is not None and self.path_embeddings is not None:
+            # 计算每条路径与所有关系的相关性
+            # path_embeddings: [num_paths, dim]
+            # rel_embed: [num_rel*2, dim]
+            num_rels = rel_embed.size(0)
+
+            # 使用双线性层计算查询-路径相关性
+            # 扩展维度以进行批量计算
+            path_emb_exp = self.path_embeddings.unsqueeze(0).expand(num_rels, -1, -1)  # [num_rels, num_paths, dim]
+            rel_emb_exp = rel_embed.unsqueeze(1).expand(-1, num_paths, -1)  # [num_rels, num_paths, dim]
+
+            # 计算相关性分数
+            query_path_scores = self.query_path_bilinear(
+                rel_emb_exp.reshape(-1, dim),
+                path_emb_exp.reshape(-1, dim)
+            ).reshape(num_rels, num_paths)  # [num_rels, num_paths]
+
+            # 对所有节点广播（每个节点根据其相关关系获得不同权重）
+            # 这里简化处理：使用平均相关性作为路径的"全局重要性"
+            query_attn = query_path_scores.mean(dim=0)  # [num_paths]
+            query_attn = query_attn.unsqueeze(0).unsqueeze(-1).expand(N, -1, -1)  # [N, num_paths, 1]
+
+            # 融合两种注意力
+            w = torch.sigmoid(self.query_weight)
+            combined_attn = w * feature_attn + (1 - w) * query_attn
+            attn_weights = F.softmax(combined_attn, dim=1)  # [N, num_paths, 1]
+        else:
+            # 如果没有关系嵌入，退回到仅使用特征注意力
+            attn_weights = F.softmax(feature_attn, dim=1)
 
         # 加权求和
         remote_features = (attn_weights * path_features).sum(dim=1)  # [N, dim]
-
-        # 注意：软阈值移到 AdaptiveFusion 中统一处理，避免重复应用
 
         # Log statistics
         self.forward_count += 1
         if self.forward_count % self.log_interval == 0:
             avg_attn = attn_weights.mean(dim=0).squeeze()  # [num_paths]
             remote_norm = remote_features.norm(dim=1).mean().item()
+            w_val = torch.sigmoid(self.query_weight).item() if rel_embed is not None else 1.0
             print(f"[RPG-Aggregator] Step {self.forward_count}: "
                   f"remote_norm={remote_norm:.3f}, "
+                  f"query_weight={w_val:.3f}, "
                   f"attn_dist={avg_attn.tolist()[:3]}")
 
         return remote_features
