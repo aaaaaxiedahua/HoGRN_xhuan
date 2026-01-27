@@ -8,10 +8,13 @@ RPG-HoGRN: Relation Path Guided Module (Refactored)
 4. P3: Query-Aware Path Attention (查询感知的路径注意力)
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_scatter import scatter_add
+
+logger = logging.getLogger(__name__)
 
 
 class PathGuidedAggregator(nn.Module):
@@ -65,9 +68,9 @@ class PathGuidedAggregator(nn.Module):
         self.log_interval = 100
         self.forward_count = 0
 
-        print(f"[RPG-Aggregator] embed_dim={embed_dim}, top_k={top_k_paths}, sparse_threshold={sparse_threshold}")
-        print(f"[RPG-Aggregator] Loaded {len(frequent_paths)} paths, {len(rel_to_paths)} relations indexed")
-        print(f"[RPG-Aggregator] P3 Query-Aware Attention enabled")
+        logger.info(f"[RPG-Aggregator] embed_dim={embed_dim}, top_k={top_k_paths}, sparse_threshold={sparse_threshold}")
+        logger.info(f"[RPG-Aggregator] Loaded {len(frequent_paths)} paths, {len(rel_to_paths)} relations indexed")
+        logger.info(f"[RPG-Aggregator] P3 Query-Aware Attention enabled")
 
         # 分路径存储（不合并）
         self.path_matrices_list = None  # [(path_tuple, sparse_matrix, norm_vector), ...]
@@ -77,7 +80,7 @@ class PathGuidedAggregator(nn.Module):
 
     def build_relation_matrices(self, edge_index, edge_type, num_ent, device):
         """Build sparse adjacency matrix for each relation."""
-        print(f"[RPG-Aggregator] Building relation matrices...")
+        logger.info(f"[RPG-Aggregator] Building relation matrices...")
         self.rel_matrices = {}
 
         for r in range(self.num_relations * 2):
@@ -92,11 +95,11 @@ class PathGuidedAggregator(nn.Module):
                 indices, val, (num_ent, num_ent), device=device
             ).coalesce()
 
-        print(f"[RPG-Aggregator] Built {len(self.rel_matrices)} relation matrices")
+        logger.info(f"[RPG-Aggregator] Built {len(self.rel_matrices)} relation matrices")
 
     def build_path_matrices(self, num_ent, device):
         """Build separate path matrix for each frequent path (不合并)."""
-        print(f"[RPG-Aggregator] Building path matrices (分路径存储)...")
+        logger.info(f"[RPG-Aggregator] Building path matrices (分路径存储)...")
 
         self.path_matrices_list = []
         valid_count = 0
@@ -152,12 +155,12 @@ class PathGuidedAggregator(nn.Module):
             self.path_matrices_list.append((path, norm_path_mat))
             valid_count += 1
 
-        print(f"[RPG-Aggregator] Built {valid_count} path matrices, skipped {skip_count}")
+        logger.info(f"[RPG-Aggregator] Built {valid_count} path matrices, skipped {skip_count}")
 
         if valid_count > 0:
-            print(f"[RPG-Aggregator] Top paths:")
+            logger.info(f"[RPG-Aggregator] Top paths:")
             for i, (path, _) in enumerate(self.path_matrices_list[:5]):
-                print(f"  Path {i}: {path}")
+                logger.info(f"  Path {i}: {path}")
 
         # ===== P3: 预计算路径嵌入 =====
         self._build_path_embeddings(device)
@@ -174,7 +177,7 @@ class PathGuidedAggregator(nn.Module):
             path_tensor = torch.tensor(list(path), dtype=torch.long, device=device)
             self.path_relations.append(path_tensor)
 
-        print(f"[RPG-Aggregator] Prepared {len(self.path_relations)} path relations for embedding")
+        logger.info(f"[RPG-Aggregator] Prepared {len(self.path_relations)} path relations for embedding")
 
     def _compute_path_embeddings(self):
         """每次forward时计算路径嵌入（支持梯度反传）"""
@@ -273,7 +276,7 @@ class PathGuidedAggregator(nn.Module):
             avg_attn = attn_weights.mean(dim=0).squeeze()  # [num_paths]
             remote_norm = remote_features.norm(dim=1).mean().item()
             w_val = torch.sigmoid(self.query_weight).item() if rel_embed is not None else 1.0
-            print(f"[RPG-Aggregator] Step {self.forward_count}: "
+            logger.info(f"[RPG-Aggregator] Step {self.forward_count}: "
                   f"remote_norm={remote_norm:.3f}, "
                   f"query_weight={w_val:.3f}, "
                   f"attn_dist={avg_attn.tolist()[:3]}")
@@ -304,7 +307,7 @@ class AdaptiveFusion(nn.Module):
         self.forward_count = 0
         self.alpha_sum = 0.0
 
-        print(f"[RPG-Fusion] embed_dim={embed_dim}, sparse_threshold={sparse_threshold}, dropout={dropout}")
+        logger.info(f"[RPG-Fusion] embed_dim={embed_dim}, sparse_threshold={sparse_threshold}, dropout={dropout}")
 
     def forward(self, h_local, h_remote, node_degrees):
         """
@@ -339,7 +342,7 @@ class AdaptiveFusion(nn.Module):
         if self.forward_count % self.log_interval == 0:
             avg_alpha = self.alpha_sum / self.forward_count
             curr_alpha = alpha.mean().item()
-            print(f"[RPG-Fusion] Step {self.forward_count}: "
+            logger.info(f"[RPG-Fusion] Step {self.forward_count}: "
                   f"curr_alpha={curr_alpha:.4f}, avg_alpha={avg_alpha:.4f}, "
                   f"scale={self.scale.item():.4f}, temp={self.temperature.item():.4f}")
 
