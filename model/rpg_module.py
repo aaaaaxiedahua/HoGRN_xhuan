@@ -46,6 +46,9 @@ class PathGuidedAggregator(nn.Module):
             nn.Linear(embed_dim // 2, 1)
         )
 
+        # P4: 注意力温度（防止注意力崩塌）
+        self.attn_temperature = nn.Parameter(torch.tensor(1.0))
+
         # ===== P3: Query-Aware Path Attention =====
         # 关系嵌入（用于编码路径）
         self.rel_embed = nn.Embedding(num_relations * 2, embed_dim)
@@ -262,10 +265,13 @@ class PathGuidedAggregator(nn.Module):
             # 融合两种注意力
             w = torch.sigmoid(self.query_weight)
             combined_attn = w * feature_attn + (1 - w) * query_attn
-            attn_weights = F.softmax(combined_attn, dim=1)  # [N, num_paths, 1]
+            # P4: 使用温度参数防止注意力崩塌
+            tau = F.softplus(self.attn_temperature) + 0.1  # 确保温度 > 0.1
+            attn_weights = F.softmax(combined_attn / tau, dim=1)  # [N, num_paths, 1]
         else:
             # 如果没有关系嵌入，退回到仅使用特征注意力
-            attn_weights = F.softmax(feature_attn, dim=1)
+            tau = F.softplus(self.attn_temperature) + 0.1
+            attn_weights = F.softmax(feature_attn / tau, dim=1)
 
         # 加权求和
         remote_features = (attn_weights * path_features).sum(dim=1)  # [N, dim]
@@ -276,9 +282,11 @@ class PathGuidedAggregator(nn.Module):
             avg_attn = attn_weights.mean(dim=0).squeeze()  # [num_paths]
             remote_norm = remote_features.norm(dim=1).mean().item()
             w_val = torch.sigmoid(self.query_weight).item() if rel_embed is not None else 1.0
+            tau_val = (F.softplus(self.attn_temperature) + 0.1).item()
             logger.info(f"[RPG-Aggregator] Step {self.forward_count}: "
                   f"remote_norm={remote_norm:.3f}, "
                   f"query_weight={w_val:.3f}, "
+                  f"attn_temp={tau_val:.3f}, "
                   f"attn_dist={avg_attn.tolist()[:3]}")
 
         return remote_features
@@ -296,11 +304,15 @@ class AdaptiveFusion(nn.Module):
 
         # 可学习的融合参数
         self.temperature = nn.Parameter(torch.tensor(2.0))
-        self.scale = nn.Parameter(torch.tensor(1.0))  # 控制融合强度（从0.5提高到1.0）
+        # P4: 使用 scale_raw，通过 softplus 确保 scale >= 0.5
+        self.scale_raw = nn.Parameter(torch.tensor(0.5))  # softplus(0.5) + 0.5 ≈ 1.0
 
         # 可选：特征变换（让 remote 和 local 在同一空间）
         self.transform = nn.Linear(embed_dim, embed_dim, bias=False)
         nn.init.eye_(self.transform.weight)  # 初始化为单位矩阵
+
+        # P4: LayerNorm 归一化 remote 特征
+        self.layer_norm = nn.LayerNorm(embed_dim)
 
         # Log statistics
         self.log_interval = 100
@@ -308,6 +320,7 @@ class AdaptiveFusion(nn.Module):
         self.alpha_sum = 0.0
 
         logger.info(f"[RPG-Fusion] embed_dim={embed_dim}, sparse_threshold={sparse_threshold}, dropout={dropout}")
+        logger.info(f"[RPG-Fusion] P4: LayerNorm enabled, scale constrained >= 0.5")
 
     def forward(self, h_local, h_remote, node_degrees):
         """
@@ -325,10 +338,13 @@ class AdaptiveFusion(nn.Module):
         alpha = torch.sigmoid(
             (self.sparse_threshold - node_degrees.float()) / self.temperature
         )
-        alpha = alpha * self.scale  # 缩放到合理范围
+        # P4: scale 通过 softplus 确保 >= 0.5，防止模型"逃避"使用 remote 特征
+        scale = F.softplus(self.scale_raw) + 0.5
+        alpha = alpha * scale
         alpha = alpha.unsqueeze(1)  # [N, 1]
 
-        # 特征变换 + dropout
+        # P4: LayerNorm 归一化 + 特征变换 + dropout
+        h_remote = self.layer_norm(h_remote)
         h_remote = self.transform(h_remote)
         h_remote = self.dropout(h_remote)
 
@@ -342,9 +358,10 @@ class AdaptiveFusion(nn.Module):
         if self.forward_count % self.log_interval == 0:
             avg_alpha = self.alpha_sum / self.forward_count
             curr_alpha = alpha.mean().item()
+            scale_val = (F.softplus(self.scale_raw) + 0.5).item()
             logger.info(f"[RPG-Fusion] Step {self.forward_count}: "
                   f"curr_alpha={curr_alpha:.4f}, avg_alpha={avg_alpha:.4f}, "
-                  f"scale={self.scale.item():.4f}, temp={self.temperature.item():.4f}")
+                  f"scale={scale_val:.4f}, temp={self.temperature.item():.4f}")
 
         return h_fused, alpha.squeeze(1)
 
