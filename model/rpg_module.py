@@ -170,22 +170,15 @@ class PathGuidedAggregator(nn.Module):
         # 加权求和
         remote_features = (attn_weights * path_features).sum(dim=1)  # [N, dim]
 
-        # ===== 3. 软阈值 =====
-        # sigmoid((threshold - degree) / temperature)
-        # 度数低 -> 值接近1，度数高 -> 值接近0
-        soft_mask = torch.sigmoid(
-            (self.sparse_threshold - node_degrees.float()) / self.temperature
-        )
-        remote_features = remote_features * soft_mask.unsqueeze(1)
+        # 注意：软阈值移到 AdaptiveFusion 中统一处理，避免重复应用
 
         # Log statistics
         self.forward_count += 1
         if self.forward_count % self.log_interval == 0:
             avg_attn = attn_weights.mean(dim=0).squeeze()  # [num_paths]
-            avg_mask = soft_mask.mean().item()
-            enhanced = (soft_mask > 0.5).sum().item()
+            remote_norm = remote_features.norm(dim=1).mean().item()
             print(f"[RPG-Aggregator] Step {self.forward_count}: "
-                  f"enhanced={enhanced}, avg_soft_mask={avg_mask:.3f}, "
+                  f"remote_norm={remote_norm:.3f}, "
                   f"attn_dist={avg_attn.tolist()[:3]}")
 
         return remote_features
@@ -203,7 +196,7 @@ class AdaptiveFusion(nn.Module):
 
         # 可学习的融合参数
         self.temperature = nn.Parameter(torch.tensor(2.0))
-        self.scale = nn.Parameter(torch.tensor(0.5))  # 控制融合强度
+        self.scale = nn.Parameter(torch.tensor(1.0))  # 控制融合强度（从0.5提高到1.0）
 
         # 可选：特征变换（让 remote 和 local 在同一空间）
         self.transform = nn.Linear(embed_dim, embed_dim, bias=False)
