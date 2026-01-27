@@ -71,7 +71,7 @@ class PathGuidedAggregator(nn.Module):
 
         # 分路径存储（不合并）
         self.path_matrices_list = None  # [(path_tuple, sparse_matrix, norm_vector), ...]
-        self.path_embeddings = None  # 预计算的路径嵌入 [num_paths, embed_dim]
+        self.path_relations = None  # 路径的关系ID列表，用于动态计算嵌入
         self.rel_matrices = None
         self.num_ent = None
 
@@ -163,15 +163,26 @@ class PathGuidedAggregator(nn.Module):
         self._build_path_embeddings(device)
 
     def _build_path_embeddings(self, device):
-        """预计算每条路径的嵌入向量"""
+        """预计算每条路径的嵌入向量（每次forward时重新计算，以支持梯度更新）"""
         if not self.path_matrices_list:
             self.path_embeddings = None
             return
 
-        path_embeds = []
+        # 存储路径的关系ID，用于每次forward时重新计算嵌入
+        self.path_relations = []
         for path, _ in self.path_matrices_list:
-            # 将路径中的关系ID转为tensor
             path_tensor = torch.tensor(list(path), dtype=torch.long, device=device)
+            self.path_relations.append(path_tensor)
+
+        print(f"[RPG-Aggregator] Prepared {len(self.path_relations)} path relations for embedding")
+
+    def _compute_path_embeddings(self):
+        """每次forward时计算路径嵌入（支持梯度反传）"""
+        if not self.path_relations:
+            return None
+
+        path_embeds = []
+        for path_tensor in self.path_relations:
             # 获取关系嵌入
             rel_embeds = self.rel_embed(path_tensor)  # [path_len, embed_dim]
             # 通过GRU编码
@@ -180,8 +191,7 @@ class PathGuidedAggregator(nn.Module):
             path_embed = h_n.squeeze(0).squeeze(0)  # [embed_dim]
             path_embeds.append(path_embed)
 
-        self.path_embeddings = torch.stack(path_embeds, dim=0)  # [num_paths, embed_dim]
-        print(f"[RPG-Aggregator] Built path embeddings: {self.path_embeddings.shape}")
+        return torch.stack(path_embeds, dim=0)  # [num_paths, embed_dim]
 
     def forward(self, entity_embeds, node_degrees, edge_index, edge_type, rel_embed=None):
         """
@@ -222,15 +232,17 @@ class PathGuidedAggregator(nn.Module):
         feature_attn = self.path_attention(path_features)  # [N, num_paths, 1]
 
         # ===== 3. P3: 查询感知注意力（新增）=====
-        if rel_embed is not None and self.path_embeddings is not None:
+        if rel_embed is not None and hasattr(self, 'path_relations') and self.path_relations:
+            # 每次forward重新计算路径嵌入（支持梯度）
+            path_embeddings = self._compute_path_embeddings()  # [num_paths, dim]
+
             # 计算每条路径与所有关系的相关性
-            # path_embeddings: [num_paths, dim]
             # rel_embed: [num_rel*2, dim]
             num_rels = rel_embed.size(0)
 
             # 使用双线性层计算查询-路径相关性
             # 扩展维度以进行批量计算
-            path_emb_exp = self.path_embeddings.unsqueeze(0).expand(num_rels, -1, -1)  # [num_rels, num_paths, dim]
+            path_emb_exp = path_embeddings.unsqueeze(0).expand(num_rels, -1, -1)  # [num_rels, num_paths, dim]
             rel_emb_exp = rel_embed.unsqueeze(1).expand(-1, num_paths, -1)  # [num_rels, num_paths, dim]
 
             # 计算相关性分数
