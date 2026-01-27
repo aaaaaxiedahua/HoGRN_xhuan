@@ -5,9 +5,12 @@ This module discovers frequent relation paths from the knowledge graph.
 Paths are mined during preprocessing (no gradients needed).
 """
 
+import logging
 from collections import defaultdict
 import pickle
 import os
+
+logger = logging.getLogger(__name__)
 
 
 class PathMiner:
@@ -25,7 +28,7 @@ class PathMiner:
         self.triples = triples
         self.num_relations = num_relations
 
-        print(f"[PathMiner] Initializing with {len(triples)} triples, {num_relations} relations")
+        logger.info(f"[PathMiner] Initializing with {len(triples)} triples, {num_relations} relations")
 
         # Build adjacency list: entity -> [(relation, neighbor), ...]
         self.adj_out = defaultdict(list)  # outgoing edges
@@ -35,7 +38,7 @@ class PathMiner:
             self.adj_out[h].append((r, t))
             self.adj_in[t].append((r, h))
 
-        print(f"[PathMiner] Built adjacency: {len(self.adj_out)} entities with outgoing edges")
+        logger.info(f"[PathMiner] Built adjacency: {len(self.adj_out)} entities with outgoing edges")
 
     def mine_paths(self, max_length=3, min_count=50):
         """
@@ -65,8 +68,8 @@ class PathMiner:
                         path_count[(r1, r2, r3)] += 1
                         path_3_count += 1
 
-        print(f"[PathMiner] Raw path instances: 2-hop={path_2_count}, 3-hop={path_3_count}")
-        print(f"[PathMiner] Unique path patterns before filtering: {len(path_count)}")
+        logger.info(f"[PathMiner] Raw path instances: 2-hop={path_2_count}, 3-hop={path_3_count}")
+        logger.info(f"[PathMiner] Unique path patterns before filtering: {len(path_count)}")
 
         # Filter by frequency
         frequent_paths = {
@@ -78,13 +81,13 @@ class PathMiner:
         # Statistics
         path_2_filtered = sum(1 for p in frequent_paths if len(p) == 2)
         path_3_filtered = sum(1 for p in frequent_paths if len(p) == 3)
-        print(f"[PathMiner] After filtering (min_count={min_count}): 2-hop={path_2_filtered}, 3-hop={path_3_filtered}")
+        logger.info(f"[PathMiner] After filtering (min_count={min_count}): 2-hop={path_2_filtered}, 3-hop={path_3_filtered}")
 
         # Show top-5 frequent paths
         sorted_paths = sorted(frequent_paths.items(), key=lambda x: -x[1])[:5]
-        print(f"[PathMiner] Top-5 frequent paths:")
+        logger.info(f"[PathMiner] Top-5 frequent paths:")
         for path, count in sorted_paths:
-            print(f"  {path} -> {count} times")
+            logger.info(f"  {path} -> {count} times")
 
         return frequent_paths
 
@@ -128,12 +131,12 @@ def mine_and_save_paths(triples, num_relations, save_dir,
     """
     miner = PathMiner(triples, num_relations)
 
-    print(f"[PathMiner] Mining paths (max_len={max_length}, min_count={min_count})...")
+    logger.info(f"[PathMiner] Mining paths (max_len={max_length}, min_count={min_count})...")
     frequent_paths = miner.mine_paths(max_length, min_count)
-    print(f"[PathMiner] Found {len(frequent_paths)} frequent paths")
+    logger.info(f"[PathMiner] Found {len(frequent_paths)} frequent paths")
 
     rel_to_paths = miner.build_path_index(frequent_paths)
-    print(f"[PathMiner] Built index for {len(rel_to_paths)} relations")
+    logger.info(f"[PathMiner] Built index for {len(rel_to_paths)} relations")
 
     # Save to disk
     os.makedirs(save_dir, exist_ok=True)
@@ -147,7 +150,7 @@ def mine_and_save_paths(triples, num_relations, save_dir,
             'min_count': min_count
         }, f)
 
-    print(f"[PathMiner] Saved to {save_path}")
+    logger.info(f"[PathMiner] Saved to {save_path}")
 
     return frequent_paths, rel_to_paths
 
@@ -162,5 +165,5 @@ def load_paths(save_dir):
     with open(save_path, 'rb') as f:
         data = pickle.load(f)
 
-    print(f"[PathMiner] Loaded {len(data['frequent_paths'])} paths from {save_path}")
+    logger.info(f"[PathMiner] Loaded {len(data['frequent_paths'])} paths from {save_path}")
     return data['frequent_paths'], data['rel_to_paths']

@@ -46,9 +46,6 @@ class PathGuidedAggregator(nn.Module):
             nn.Linear(embed_dim // 2, 1)
         )
 
-        # P4: 注意力温度（防止注意力崩塌）
-        self.attn_temperature = nn.Parameter(torch.tensor(1.0))
-
         # ===== P3: Query-Aware Path Attention =====
         # 关系嵌入（用于编码路径）
         self.rel_embed = nn.Embedding(num_relations * 2, embed_dim)
@@ -265,13 +262,10 @@ class PathGuidedAggregator(nn.Module):
             # 融合两种注意力
             w = torch.sigmoid(self.query_weight)
             combined_attn = w * feature_attn + (1 - w) * query_attn
-            # P4: 使用温度参数防止注意力崩塌
-            tau = F.softplus(self.attn_temperature) + 0.1  # 确保温度 > 0.1
-            attn_weights = F.softmax(combined_attn / tau, dim=1)  # [N, num_paths, 1]
+            attn_weights = F.softmax(combined_attn, dim=1)  # [N, num_paths, 1]
         else:
             # 如果没有关系嵌入，退回到仅使用特征注意力
-            tau = F.softplus(self.attn_temperature) + 0.1
-            attn_weights = F.softmax(feature_attn / tau, dim=1)
+            attn_weights = F.softmax(feature_attn, dim=1)
 
         # 加权求和
         remote_features = (attn_weights * path_features).sum(dim=1)  # [N, dim]
@@ -282,11 +276,9 @@ class PathGuidedAggregator(nn.Module):
             avg_attn = attn_weights.mean(dim=0).squeeze()  # [num_paths]
             remote_norm = remote_features.norm(dim=1).mean().item()
             w_val = torch.sigmoid(self.query_weight).item() if rel_embed is not None else 1.0
-            tau_val = (F.softplus(self.attn_temperature) + 0.1).item()
             logger.info(f"[RPG-Aggregator] Step {self.forward_count}: "
                   f"remote_norm={remote_norm:.3f}, "
                   f"query_weight={w_val:.3f}, "
-                  f"attn_temp={tau_val:.3f}, "
                   f"attn_dist={avg_attn.tolist()[:3]}")
 
         return remote_features

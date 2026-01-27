@@ -1,7 +1,10 @@
+import logging
 from re import X
 import torch.nn as nn
 from helper import *
 from model.hogrn_conv import HoGRNConv
+
+logger = logging.getLogger(__name__)
 
 class BaseModel(torch.nn.Module):
 	def __init__(self, params):
@@ -65,7 +68,7 @@ class HoGRNBase(BaseModel):
 			)
 
 			self.last_rpg_gates = None
-			print(f"[RPG] Enabled with {len(frequent_paths)} paths")
+			logger.info(f"[RPG] Enabled with {len(frequent_paths)} paths")
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
