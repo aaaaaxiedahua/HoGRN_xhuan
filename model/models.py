@@ -60,6 +60,7 @@ class HoGRNBase(BaseModel):
 
 			self.rpg_fusion = AdaptiveFusion(
 				embed_dim=rpg_dim,
+				sparse_threshold=getattr(self.p, 'rpg_sparse_threshold', 5),
 				dropout=getattr(self.p, 'rpg_fusion_dropout', 0.1)
 			)
 
