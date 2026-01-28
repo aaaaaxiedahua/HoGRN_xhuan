@@ -93,7 +93,7 @@ class Runner(object):
 		self.edge_index, self.edge_type = self.construct_adj()
 
 		# ===== RPG-HoGRN: Mine relation paths =====
-		if hasattr(self.p, 'use_rpg') and self.p.use_rpg:
+		if getattr(self.p, 'use_path_score', False):
 			from model.path_mining import mine_and_save_paths, load_paths
 			path_dir = f'./data/{self.p.dataset}/paths'
 
