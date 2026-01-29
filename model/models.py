@@ -43,19 +43,15 @@ class HoGRNBase(BaseModel):
 		self.register_buffer('node_deg', norm_deg)
 		self.register_buffer('node_deg_raw', raw_deg)
 
-		# ===== RPG-HoGRN: Path Score Enhancement (得分增强) =====
-		if hasattr(self.p, 'use_path_score') and self.p.use_path_score:
-			from model.rpg_module import PathScoreEnhancer
+		# ===== Reverse Path Reasoning (逆向路径推理) =====
+		if getattr(self.p, 'use_reverse_path', False):
+			from model.rpg_module import ReversePathReasoner
 
-			frequent_paths = getattr(self.p, 'frequent_paths', {})
-
-			self.path_score_enhancer = PathScoreEnhancer(
-				embed_dim=self.p.embed_dim,
+			self.reverse_path_reasoner = ReversePathReasoner(
 				num_relations=num_rel,
-				frequent_paths=frequent_paths,
-				top_k_paths=getattr(self.p, 'rpg_top_k_paths', 10)
+				num_ent=self.p.num_ent
 			)
-			logger.info(f"[RPG] Path score enhancement enabled with {len(frequent_paths)} paths")
+			logger.info(f"[ReversePath] Reverse path reasoning enabled")
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -194,12 +190,11 @@ class HoGRN_ConvE(HoGRNBase):
 		x 		= torch.mm(x, all_ent.transpose(1,0))
 		x 		+= self.bias.expand_as(x)
 
-		# ===== Path Score Enhancement (新方案) =====
-		if hasattr(self.p, 'use_path_score') and self.p.use_path_score:
-			x = self.path_score_enhancer(
+		# ===== Reverse Path Reasoning (逆向路径推理) =====
+		if getattr(self.p, 'use_reverse_path', False):
+			x = self.reverse_path_reasoner(
 				original_score=x,
-				head_idx=sub,
-				rel_embed=rel_emb,
+				query_rel=rel,
 				edge_index=self.edge_index,
 				edge_type=self.edge_type
 			)

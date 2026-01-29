@@ -1,13 +1,15 @@
 """
-RPG-HoGRN: Path Score Enhancement Module
+RPG-HoGRN: Reverse Path Reasoning Module (逆向路径推理)
 
-核心思想：在原始预测得分上加上路径可达性得分
-- 方式 D：查询感知路径打分
-- 不同查询关系偏好不同路径
-- path_score = Σ relevance(path, query_rel) × reachable(head, tail, path)
+核心思想：学习每个关系的"答案模式"，推理时检查候选实体是否符合该模式
+- 离线统计：对每个关系 r，统计其答案实体的入边/出边模式频率
+- 在线推理：对所有候选实体计算模式匹配得分，加到原始得分上
+- 不依赖 head→tail 的路径连通性，只看 tail 自身的局部结构
 """
 
 import logging
+from collections import defaultdict
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,212 +17,220 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
-class PathScoreEnhancer(nn.Module):
+class ReversePathReasoner(nn.Module):
     """
-    路径得分增强模块：在原始预测得分上加上路径可达性得分
+    逆向路径推理模块
 
-    方式 D：查询感知路径打分
-    - 不同查询关系偏好不同路径
-    - path_score = Σ relevance(path, query_rel) × reachable(head, tail, path)
+    离线阶段：
+      1. 收集每个关系的答案实体
+      2. 统计答案实体的入边/出边模式频率
+      3. 构建实体-模式矩阵 M[N, P] (连续值, log(1+count))
+      4. 构建关系-模式权重矩阵 W[R, P] (频率作为初始值)
+
+    在线阶段：
+      score = M @ W[query_rel]  →  [batch, N]
+      final = original_score + gamma * normalize(score)
     """
 
-    def __init__(self, embed_dim, num_relations, frequent_paths, top_k_paths=10):
+    def __init__(self, num_relations, num_ent):
         super().__init__()
-        self.embed_dim = embed_dim
         self.num_relations = num_relations
-        self.frequent_paths = frequent_paths
-        self.top_k_paths = top_k_paths
-
-        # 路径编码器
-        self.rel_embed = nn.Embedding(num_relations * 2, embed_dim)
-        self.path_encoder = nn.GRU(
-            input_size=embed_dim,
-            hidden_size=embed_dim,
-            batch_first=True,
-            bidirectional=False
-        )
-
-        # 查询-路径相关性计算
-        self.query_path_scorer = nn.Bilinear(embed_dim, embed_dim, 1)
-
-        # 可学习的缩放因子
-        self.beta = nn.Parameter(torch.tensor(0.1))
-
-        # 路径矩阵和关系序列
-        self.path_matrices = None  # list of sparse [N, N]
-        self.path_matrices_dense = None  # list of dense [N, N] (缓存)
-        self.path_relations = None  # list of tensors
-        self.num_ent = None
-
-        # Log statistics
-        self.log_interval = 100
-        self.forward_count = 0
-
-        logger.info(f"[PathScoreEnhancer] embed_dim={embed_dim}, top_k_paths={top_k_paths}")
-        logger.info(f"[PathScoreEnhancer] Loaded {len(frequent_paths)} frequent paths")
-
-    def build_matrices(self, edge_index, edge_type, num_ent, device):
-        """构建路径矩阵（首次调用时执行）"""
-        logger.info(f"[PathScoreEnhancer] Building path matrices...")
         self.num_ent = num_ent
 
-        # 1. 构建每个关系的邻接矩阵
-        rel_matrices = {}
-        for r in range(self.num_relations * 2):
-            mask = (edge_type == r)
-            if mask.sum() == 0:
-                continue
-            r_edge = edge_index[:, mask]
-            row, col = r_edge[0], r_edge[1]
-            val = torch.ones(row.size(0), device=device)
-            indices = torch.stack([row, col], dim=0)
-            rel_matrices[r] = torch.sparse_coo_tensor(
-                indices, val, (num_ent, num_ent), device=device
-            ).coalesce()
+        # 模式总数 = 2 * num_relations * 2 (入边/出边 × 含逆关系)
+        # 入边模式: (in, r) for r in 0..2*num_rel-1
+        # 出边模式: (out, r) for r in 0..2*num_rel-1
+        self.num_patterns = 2 * num_relations * 2  # in/out × all relations (含逆)
 
-        logger.info(f"[PathScoreEnhancer] Built {len(rel_matrices)} relation matrices")
+        # 可学习的关系-模式权重 (初始化后会用频率覆盖)
+        # W[r, p]: 关系 r 对模式 p 的权重
+        self.pattern_weight = nn.Parameter(torch.zeros(num_relations * 2, self.num_patterns))
 
-        # 2. 构建路径矩阵
-        self.path_matrices = []
-        self.path_relations = []
+        # 可学习的融合系数
+        self.gamma = nn.Parameter(torch.tensor(0.1))
 
-        sorted_paths = sorted(self.frequent_paths.items(), key=lambda x: -x[1])
-        valid_count = 0
+        # 实体-模式矩阵 (buffer, 不参与梯度)
+        self.register_buffer('entity_pattern_matrix', torch.zeros(num_ent, self.num_patterns))
 
-        for path, freq in sorted_paths[:self.top_k_paths * 10]:
-            if len(self.path_matrices) >= self.top_k_paths:
-                break
+        # 是否已构建
+        self.built = False
 
-            # 检查路径有效性
-            if path[0] not in rel_matrices:
-                continue
+        # Log
+        self.forward_count = 0
+        self.log_interval = 100
 
-            # 计算路径矩阵: A_r1 @ A_r2 @ ...
-            path_mat = rel_matrices[path[0]]
-            valid = True
+        logger.info(f"[ReversePathReasoner] num_relations={num_relations}, "
+                    f"num_ent={num_ent}, num_patterns={self.num_patterns}")
 
-            for r in path[1:]:
-                if r not in rel_matrices:
-                    valid = False
-                    break
-                path_mat = torch.sparse.mm(path_mat, rel_matrices[r])
+    def _pattern_index(self, direction, rel_id):
+        """将 (direction, rel_id) 映射为模式索引"""
+        # direction: 0=in, 1=out
+        # rel_id: 0 ~ 2*num_rel-1
+        return direction * (self.num_relations * 2) + rel_id
 
-            if not valid:
-                continue
-
-            path_mat = path_mat.coalesce()
-            if path_mat.indices().size(1) == 0:
-                continue
-
-            # 二值化（只关心可达性，不关心路径数）
-            indices = path_mat.indices()
-            val = torch.ones(indices.size(1), device=device)
-            binary_mat = torch.sparse_coo_tensor(
-                indices, val, (num_ent, num_ent), device=device
-            ).coalesce()
-
-            self.path_matrices.append(binary_mat)
-            path_tensor = torch.tensor(list(path), dtype=torch.long, device=device)
-            self.path_relations.append(path_tensor)
-            valid_count += 1
-
-        logger.info(f"[PathScoreEnhancer] Built {valid_count} path matrices")
-        if valid_count > 0:
-            for i, path_rel in enumerate(self.path_relations[:5]):
-                logger.info(f"  Path {i}: {path_rel.tolist()}")
-
-    def _compute_path_embeddings(self):
-        """计算所有路径的嵌入向量"""
-        if not self.path_relations:
-            return None
-
-        path_embeds = []
-        for path_tensor in self.path_relations:
-            rel_embeds = self.rel_embed(path_tensor)  # [path_len, dim]
-            rel_embeds = rel_embeds.unsqueeze(0)  # [1, path_len, dim]
-            _, h_n = self.path_encoder(rel_embeds)  # [1, 1, dim]
-            path_embeds.append(h_n.squeeze(0).squeeze(0))
-
-        return torch.stack(path_embeds, dim=0)  # [num_paths, dim]
-
-    def forward(self, original_score, head_idx, rel_embed, edge_index, edge_type):
+    def build(self, triples, edge_index, edge_type, device):
         """
-        在原始得分上加上路径得分
+        离线构建实体-模式矩阵和关系-模式权重
+
+        Args:
+            triples: list of (h, r, t) 训练三元组
+            edge_index: [2, E] 边索引
+            edge_type: [E] 边类型
+            device: torch device
+        """
+        logger.info("[ReversePathReasoner] Building entity-pattern matrix and relation-pattern weights...")
+
+        num_rel_total = self.num_relations * 2  # 含逆关系
+
+        # ===== Step 1: 构建入边/出边索引 =====
+        # 使用 edge_index 和 edge_type (包含逆关系)
+        edge_src = edge_index[0].cpu().numpy()
+        edge_dst = edge_index[1].cpu().numpy()
+        edge_tp = edge_type.cpu().numpy()
+
+        # in_edges[entity] = [(rel, src), ...]
+        in_edges = defaultdict(list)
+        # out_edges[entity] = [(rel, dst), ...]
+        out_edges = defaultdict(list)
+
+        for i in range(len(edge_tp)):
+            src, dst, r = int(edge_src[i]), int(edge_dst[i]), int(edge_tp[i])
+            out_edges[src].append((r, dst))
+            in_edges[dst].append((r, src))
+
+        logger.info(f"[ReversePathReasoner] Built adjacency: "
+                    f"{len(out_edges)} entities with out-edges, "
+                    f"{len(in_edges)} entities with in-edges")
+
+        # ===== Step 2: 构建实体-模式矩阵 M[N, P] =====
+        # M[e][p] = log(1 + count(entity e has pattern p))
+        entity_pattern = torch.zeros(self.num_ent, self.num_patterns)
+
+        # 入边模式计数
+        for entity, edges in in_edges.items():
+            rel_count = defaultdict(int)
+            for r, _ in edges:
+                rel_count[r] += 1
+            for r, count in rel_count.items():
+                p_idx = self._pattern_index(0, r)  # in direction
+                entity_pattern[entity, p_idx] = torch.log1p(torch.tensor(float(count)))
+
+        # 出边模式计数
+        for entity, edges in out_edges.items():
+            rel_count = defaultdict(int)
+            for r, _ in edges:
+                rel_count[r] += 1
+            for r, count in rel_count.items():
+                p_idx = self._pattern_index(1, r)  # out direction
+                entity_pattern[entity, p_idx] = torch.log1p(torch.tensor(float(count)))
+
+        self.entity_pattern_matrix.copy_(entity_pattern.to(device))
+
+        # 统计非零模式
+        nonzero_count = (entity_pattern > 0).sum().item()
+        total_count = entity_pattern.numel()
+        logger.info(f"[ReversePathReasoner] Entity-pattern matrix: "
+                    f"shape={list(entity_pattern.shape)}, "
+                    f"nonzero={nonzero_count}/{total_count} "
+                    f"({100*nonzero_count/total_count:.2f}%)")
+
+        # ===== Step 3: 收集每个关系的答案实体，统计模式频率 =====
+        answer_sets = defaultdict(set)
+
+        # 使用 edge_index (已含逆关系)
+        for i in range(len(edge_tp)):
+            r = int(edge_tp[i])
+            t = int(edge_dst[i])
+            answer_sets[r].add(t)
+
+        logger.info(f"[ReversePathReasoner] Collected answer sets for {len(answer_sets)} relations")
+
+        # 计算频率: freq[r][p] = 拥有模式p的答案实体数 / 答案实体总数
+        freq_matrix = torch.zeros(num_rel_total, self.num_patterns)
+
+        for r, answers in answer_sets.items():
+            if len(answers) == 0:
+                continue
+            n_answers = len(answers)
+
+            for p_idx in range(self.num_patterns):
+                count = 0
+                for ans in answers:
+                    if entity_pattern[ans, p_idx] > 0:
+                        count += 1
+                freq_matrix[r, p_idx] = count / n_answers
+
+        # 用频率初始化可学习权重
+        with torch.no_grad():
+            self.pattern_weight.copy_(freq_matrix.to(device))
+
+        # 统计每个关系有多少非零模式
+        rel_nonzero = (freq_matrix > 0).sum(dim=1)
+        avg_patterns = rel_nonzero.float().mean().item()
+        logger.info(f"[ReversePathReasoner] Avg patterns per relation: {avg_patterns:.1f}")
+
+        # 输出前5个关系的Top模式
+        for r in range(min(5, num_rel_total)):
+            weights = freq_matrix[r]
+            top_vals, top_idxs = torch.topk(weights, min(3, (weights > 0).sum().item()))
+            if top_vals.numel() > 0:
+                patterns_str = []
+                for val, idx in zip(top_vals.tolist(), top_idxs.tolist()):
+                    direction = "in" if idx < num_rel_total else "out"
+                    rel_id = idx % num_rel_total
+                    patterns_str.append(f"({direction},r{rel_id}):{val:.2f}")
+                logger.info(f"  Rel {r} top patterns: {', '.join(patterns_str)}")
+
+        self.built = True
+        logger.info("[ReversePathReasoner] Build complete!")
+
+    def forward(self, original_score, query_rel, edge_index, edge_type):
+        """
+        在原始得分上加上逆向路径推理得分
 
         Args:
             original_score: [batch, N] 原始预测得分（sigmoid之前）
-            head_idx: [batch] 头实体索引
-            rel_embed: [batch, dim] 查询关系嵌入
-            edge_index: [2, E] 边索引（用于首次构建矩阵）
+            query_rel: [batch] 查询关系索引
+            edge_index: [2, E] 边索引（用于首次构建）
             edge_type: [E] 边类型
 
         Returns:
             final_score: [batch, N] 增强后的得分
         """
-        batch_size = head_idx.size(0)
-        device = head_idx.device
+        device = original_score.device
 
-        # 首次调用时构建矩阵
-        if self.path_matrices is None:
-            num_ent = original_score.size(1)
-            self.build_matrices(edge_index, edge_type, num_ent, device)
+        # 首次调用时构建
+        if not self.built:
+            # 从 edge_index/edge_type 构建, triples 不需要
+            self.build(triples=None, edge_index=edge_index, edge_type=edge_type, device=device)
 
-        # 如果没有有效路径，直接返回原始得分
-        if not self.path_matrices:
-            return original_score
+        # 1. 获取查询关系的模式权重
+        # query_rel: [batch]
+        # pattern_weight: [num_rel*2, num_patterns]
+        rel_weights = self.pattern_weight[query_rel]  # [batch, num_patterns]
 
-        num_paths = len(self.path_matrices)
+        # 2. 计算模式匹配得分
+        # entity_pattern_matrix: [N, num_patterns]
+        # rel_weights: [batch, num_patterns]
+        # score = rel_weights @ entity_pattern_matrix.T → [batch, N]
+        pattern_score = torch.mm(rel_weights, self.entity_pattern_matrix.t())  # [batch, N]
 
-        # 1. 计算路径嵌入
-        path_embeds = self._compute_path_embeddings()  # [num_paths, dim]
+        # 3. 归一化 (per-sample)
+        score_max = pattern_score.max(dim=1, keepdim=True)[0]  # [batch, 1]
+        pattern_score_norm = pattern_score / (score_max + 1e-8)
 
-        # 2. 计算查询-路径相关性
-        # rel_embed: [batch, dim], path_embeds: [num_paths, dim]
-        # 扩展维度进行批量计算
-        rel_exp = rel_embed.unsqueeze(1).expand(-1, num_paths, -1)  # [batch, num_paths, dim]
-        path_exp = path_embeds.unsqueeze(0).expand(batch_size, -1, -1)  # [batch, num_paths, dim]
-
-        relevance = self.query_path_scorer(
-            rel_exp.reshape(-1, self.embed_dim),
-            path_exp.reshape(-1, self.embed_dim)
-        ).reshape(batch_size, num_paths)  # [batch, num_paths]
-
-        # softmax 归一化
-        path_weights = F.softmax(relevance, dim=1)  # [batch, num_paths]
-
-        # 3. 获取每个头实体的路径可达性得分
-        # 首次调用时缓存 dense 矩阵
-        if self.path_matrices_dense is None:
-            self.path_matrices_dense = [pm.to_dense() for pm in self.path_matrices]
-            logger.info(f"[PathScoreEnhancer] Cached {len(self.path_matrices_dense)} dense path matrices")
-
-        # 对每条路径，获取从 head 可达的实体
-        path_scores_list = []
-        for path_mat_dense in self.path_matrices_dense:
-            head_reachable = path_mat_dense[head_idx]  # [batch, N]
-            path_scores_list.append(head_reachable)
-
-        # [batch, num_paths, N]
-        path_scores = torch.stack(path_scores_list, dim=1)
-
-        # 4. 加权求和
-        # path_weights: [batch, num_paths] -> [batch, num_paths, 1]
-        # path_scores: [batch, num_paths, N]
-        weighted_path_score = (path_weights.unsqueeze(-1) * path_scores).sum(dim=1)  # [batch, N]
-
-        # 5. 融合
-        beta = torch.sigmoid(self.beta)  # 限制在 0-1
-        final_score = original_score + beta * weighted_path_score
+        # 4. 融合
+        gamma = torch.sigmoid(self.gamma)
+        final_score = original_score + gamma * pattern_score_norm
 
         # Log statistics
         self.forward_count += 1
         if self.forward_count % self.log_interval == 0:
-            avg_weight = path_weights.mean(dim=0)  # [num_paths]
-            avg_path_score = weighted_path_score.mean().item()
-            beta_val = beta.item()
-            logger.info(f"[PathScoreEnhancer] Step {self.forward_count}: "
-                       f"beta={beta_val:.4f}, "
-                       f"avg_path_score={avg_path_score:.4f}, "
-                       f"path_weights={avg_weight.tolist()[:3]}")
+            avg_pattern_score = pattern_score_norm.mean().item()
+            gamma_val = gamma.item()
+            logger.info(f"[ReversePathReasoner] Step {self.forward_count}: "
+                        f"gamma={gamma_val:.4f}, "
+                        f"avg_pattern_score={avg_pattern_score:.4f}, "
+                        f"max_pattern_score={pattern_score.max().item():.4f}")
 
         return final_score

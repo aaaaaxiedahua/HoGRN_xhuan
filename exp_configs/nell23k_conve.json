@@ -15,9 +15,6 @@
   "rel_norm": true,
   "hid_drop": 0.3,
 
-  "_comment_rpg": "RPG-HoGRN: Path Score Enhancement (得分增强)",
-  "use_path_score": true,
-  "rpg_max_path_length": 2,
-  "rpg_min_path_count": 30,
-  "rpg_top_k_paths": 30
+  "_comment_reverse_path": "Reverse Path Reasoning (逆向路径推理)",
+  "use_reverse_path": true
 }
