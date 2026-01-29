@@ -15,6 +15,6 @@
   "rel_norm": true,
   "hid_drop": 0.3,
 
-  "_comment_reverse_path": "Reverse Path Reasoning (逆向路径推理)",
+  "_comment": "Reverse Path Reasoning",
   "use_reverse_path": true
 }

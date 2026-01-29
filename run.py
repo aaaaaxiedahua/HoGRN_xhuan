@@ -395,7 +395,7 @@ if __name__ == '__main__':
 	if args.config_file is not None:
 		import json
 		print(f"Loading config from: {args.config_file}")
-		with open(args.config_file, 'r') as f:
+		with open(args.config_file, 'r', encoding='utf-8') as f:
 			config = json.load(f)
 
 		# Override args with config values (command line args take precedence)
