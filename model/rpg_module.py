@@ -204,20 +204,19 @@ class ReversePathReasoner(nn.Module):
             # 从 edge_index/edge_type 构建, triples 不需要
             self.build(triples=None, edge_index=edge_index, edge_type=edge_type, device=device)
 
-        # 1. 获取查询关系的模式权重
-        # query_rel: [batch]
-        # pattern_weight: [num_rel*2, num_patterns]
-        rel_weights = self.pattern_weight[query_rel]  # [batch, num_patterns]
+        # 1. 获取查询关系的模式权重 (ReLU保证非负)
+        rel_weights = F.relu(self.pattern_weight[query_rel])  # [batch, num_patterns]
 
         # 2. 计算模式匹配得分
-        # entity_pattern_matrix: [N, num_patterns]
-        # rel_weights: [batch, num_patterns]
-        # score = rel_weights @ entity_pattern_matrix.T → [batch, N]
+        # entity_pattern_matrix: [N, num_patterns] (非负, log1p值)
+        # rel_weights: [batch, num_patterns] (非负, ReLU后)
+        # score = rel_weights @ M.T → [batch, N] (非负)
         pattern_score = torch.mm(rel_weights, self.entity_pattern_matrix.t())  # [batch, N]
 
-        # 3. 归一化 (per-sample)
-        score_max = pattern_score.max(dim=1, keepdim=True)[0]  # [batch, 1]
-        pattern_score_norm = pattern_score / (score_max + 1e-8)
+        # 3. 归一化 (per-sample, min-max to [0,1])
+        score_min = pattern_score.min(dim=1, keepdim=True)[0]
+        score_max = pattern_score.max(dim=1, keepdim=True)[0]
+        pattern_score_norm = (pattern_score - score_min) / (score_max - score_min + 1e-8)
 
         # 4. 融合
         gamma = torch.sigmoid(self.gamma)
@@ -228,9 +227,11 @@ class ReversePathReasoner(nn.Module):
         if self.forward_count % self.log_interval == 0:
             avg_pattern_score = pattern_score_norm.mean().item()
             gamma_val = gamma.item()
+            weight_min = self.pattern_weight.min().item()
+            weight_max = self.pattern_weight.max().item()
             logger.info(f"[ReversePathReasoner] Step {self.forward_count}: "
                         f"gamma={gamma_val:.4f}, "
-                        f"avg_pattern_score={avg_pattern_score:.4f}, "
-                        f"max_pattern_score={pattern_score.max().item():.4f}")
+                        f"avg_norm_score={avg_pattern_score:.4f}, "
+                        f"weight_range=[{weight_min:.3f}, {weight_max:.3f}]")
 
         return final_score
