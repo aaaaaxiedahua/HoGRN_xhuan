@@ -298,6 +298,7 @@ class Runner(object):
 		# for epoch in range(1):
 		for epoch in range(self.p.max_epochs):
 			print("########")
+			self.p._current_epoch = epoch
 			t0 = time.time()
 			train_loss  = self.run_epoch(epoch, val_mrr)
 			print("Time cost in one epoch for training: {:.4f}s".format((time.time()-t0)/60))

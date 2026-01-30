@@ -1,10 +1,11 @@
 """
-RPG-HoGRN: Reverse Path Reasoning Module
+Prototype Enhancement Module
 
-Core idea: learn "answer patterns" for each relation, check if candidate entities match
-- Offline: for each relation r, count in/out edge pattern frequency of its answer entities
-- Online: compute pattern match score for all candidates, add to original score
-- Does not depend on head->tail path connectivity, only looks at tail's local structure
+Core idea: for each relation, compute an "answer prototype" (mean embedding of all
+answer entities), then score candidates by similarity to the prototype.
+- 100% coverage: every entity gets a continuous similarity score
+- Evolves with training: prototypes update as GCN embeddings improve
+- Minimal overhead: one matrix-vector multiply per relation per epoch
 """
 
 import logging
@@ -12,150 +13,133 @@ from collections import defaultdict
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
 
-class ReversePathReasoner(nn.Module):
+class PrototypeEnhancer(nn.Module):
 
-    def __init__(self, num_relations, num_ent):
+    def __init__(self, num_relations, num_ent, embed_dim):
         super().__init__()
         self.num_relations = num_relations
         self.num_ent = num_ent
-        self.num_patterns = 2 * num_relations * 2  # in/out x all relations (incl. inverse)
+        self.embed_dim = embed_dim
+        self.num_rel_total = num_relations * 2  # including inverse
 
-        # Fixed relation-pattern weights (buffer, no gradient)
-        self.register_buffer('pattern_weight', torch.zeros(num_relations * 2, self.num_patterns))
+        # Learnable fusion coefficient (sigmoid(-3) ~ 0.05, starts small)
+        self.gamma = nn.Parameter(torch.tensor(-3.0))
 
-        # Fixed entity-pattern matrix (buffer, no gradient)
-        self.register_buffer('entity_pattern_matrix', torch.zeros(num_ent, self.num_patterns))
+        # Answer entity IDs for each relation: list of LongTensor
+        self.answer_ids = [None] * self.num_rel_total
 
-        # Pre-computed pattern scores per relation: [num_rel*2, N]
-        self.register_buffer('rel_pattern_scores', None)
-
-        # Only gamma is learnable (small init so module starts with minimal influence)
-        self.gamma = nn.Parameter(torch.tensor(-3.0))  # sigmoid(-3) ~ 0.05
+        # Cached prototype scores: [num_rel_total, N]
+        self.register_buffer('proto_scores', torch.zeros(self.num_rel_total, num_ent))
 
         self.built = False
+        self.current_epoch = -1
         self.forward_count = 0
         self.log_interval = 100
 
-        logger.info(f"[ReversePathReasoner] num_relations={num_relations}, "
-                    f"num_ent={num_ent}, num_patterns={self.num_patterns}")
+        logger.info(f"[PrototypeEnhancer] num_rel={num_relations}, "
+                    f"num_ent={num_ent}, embed_dim={embed_dim}")
 
-    def _pattern_index(self, direction, rel_id):
-        return direction * (self.num_relations * 2) + rel_id
+    def build_answer_sets(self, edge_index, edge_type):
+        """Collect answer entity IDs for each relation (one-time)."""
+        logger.info("[PrototypeEnhancer] Building answer sets...")
 
-    def build(self, edge_index, edge_type, device):
-        logger.info("[ReversePathReasoner] Building...")
-
-        num_rel_total = self.num_relations * 2
-
-        edge_src = edge_index[0].cpu().numpy()
+        answer_sets = defaultdict(set)
         edge_dst = edge_index[1].cpu().numpy()
         edge_tp = edge_type.cpu().numpy()
-        num_edges = len(edge_tp)
 
-        # Step 1: Build adjacency
-        in_edges = defaultdict(list)
-        out_edges = defaultdict(list)
-
-        for i in range(num_edges):
-            src, dst, r = int(edge_src[i]), int(edge_dst[i]), int(edge_tp[i])
-            out_edges[src].append(r)
-            in_edges[dst].append(r)
-
-        logger.info(f"[ReversePathReasoner] {len(out_edges)} entities with out-edges, "
-                    f"{len(in_edges)} entities with in-edges")
-
-        # Step 2: Build entity-pattern matrix M[N, P] = log(1 + count)
-        entity_pattern = torch.zeros(self.num_ent, self.num_patterns)
-
-        for entity, rels in in_edges.items():
-            rel_count = defaultdict(int)
-            for r in rels:
-                rel_count[r] += 1
-            for r, count in rel_count.items():
-                entity_pattern[entity, self._pattern_index(0, r)] = torch.log1p(torch.tensor(float(count)))
-
-        for entity, rels in out_edges.items():
-            rel_count = defaultdict(int)
-            for r in rels:
-                rel_count[r] += 1
-            for r, count in rel_count.items():
-                entity_pattern[entity, self._pattern_index(1, r)] = torch.log1p(torch.tensor(float(count)))
-
-        self.entity_pattern_matrix.copy_(entity_pattern.to(device))
-
-        nonzero_count = (entity_pattern > 0).sum().item()
-        total_count = entity_pattern.numel()
-        logger.info(f"[ReversePathReasoner] Entity-pattern matrix: "
-                    f"nonzero={nonzero_count}/{total_count} ({100*nonzero_count/total_count:.2f}%)")
-
-        # Step 3: Collect answer sets and compute frequency
-        answer_sets = defaultdict(set)
-        for i in range(num_edges):
+        for i in range(len(edge_tp)):
             answer_sets[int(edge_tp[i])].add(int(edge_dst[i]))
 
-        logger.info(f"[ReversePathReasoner] Answer sets for {len(answer_sets)} relations")
+        for r in range(self.num_rel_total):
+            if r in answer_sets and len(answer_sets[r]) > 0:
+                self.answer_ids[r] = torch.LongTensor(list(answer_sets[r]))
+            else:
+                self.answer_ids[r] = None
 
-        freq_matrix = torch.zeros(num_rel_total, self.num_patterns)
-        for r, answers in answer_sets.items():
-            if len(answers) == 0:
-                continue
-            n_answers = len(answers)
-            for p_idx in range(self.num_patterns):
-                count = sum(1 for ans in answers if entity_pattern[ans, p_idx] > 0)
-                freq_matrix[r, p_idx] = count / n_answers
+        covered = sum(1 for ids in self.answer_ids if ids is not None)
+        total_answers = sum(len(ids) for ids in self.answer_ids if ids is not None)
+        logger.info(f"[PrototypeEnhancer] {covered}/{self.num_rel_total} relations have answers, "
+                    f"total answer entities: {total_answers}")
 
-        self.pattern_weight.copy_(freq_matrix.to(device))
-
-        # Step 4: Pre-compute pattern scores for each relation
-        # rel_scores[r] = freq_matrix[r] @ entity_pattern_matrix.T -> [N]
-        # Then normalize per relation to [0, 1]
-        raw_scores = torch.mm(freq_matrix.to(device), self.entity_pattern_matrix.t())  # [R, N]
-
-        # Per-relation min-max normalization
-        s_min = raw_scores.min(dim=1, keepdim=True)[0]
-        s_max = raw_scores.max(dim=1, keepdim=True)[0]
-        self.rel_pattern_scores = (raw_scores - s_min) / (s_max - s_min + 1e-8)  # [R, N]
-
-        # Stats
-        avg_patterns = (freq_matrix > 0).sum(dim=1).float().mean().item()
-        avg_score = self.rel_pattern_scores.mean().item()
-        max_score = self.rel_pattern_scores.max().item()
-        logger.info(f"[ReversePathReasoner] Avg patterns/rel: {avg_patterns:.1f}, "
-                    f"avg_precomputed_score: {avg_score:.4f}, max: {max_score:.4f}")
-
-        # Top patterns for first 5 relations
-        for r in range(min(5, num_rel_total)):
-            weights = freq_matrix[r]
-            nonzero_num = (weights > 0).sum().item()
-            if nonzero_num > 0:
-                top_vals, top_idxs = torch.topk(weights, min(3, nonzero_num))
-                patterns_str = []
-                for val, idx in zip(top_vals.tolist(), top_idxs.tolist()):
-                    direction = "in" if idx < num_rel_total else "out"
-                    rel_id = idx % num_rel_total
-                    patterns_str.append(f"({direction},r{rel_id}):{val:.2f}")
-                logger.info(f"  Rel {r}: {', '.join(patterns_str)}")
+        # Log answer set sizes for first 5 relations
+        for r in range(min(5, self.num_rel_total)):
+            sz = len(self.answer_ids[r]) if self.answer_ids[r] is not None else 0
+            logger.info(f"  Rel {r}: {sz} answer entities")
 
         self.built = True
-        logger.info("[ReversePathReasoner] Build complete!")
 
-    def forward(self, original_score, query_rel, edge_index, edge_type):
-        device = original_score.device
+    def update_prototypes(self, all_ent, epoch):
+        """
+        Compute prototypes and similarity scores using current embeddings.
+        Called once per epoch.
 
+        Args:
+            all_ent: [N, dim] entity embeddings from GCN (detached)
+            epoch: current epoch number
+        """
+        if epoch == self.current_epoch:
+            return  # already updated this epoch
+
+        self.current_epoch = epoch
+        device = all_ent.device
+
+        # Normalize entity embeddings for cosine similarity
+        all_ent_norm = F.normalize(all_ent, p=2, dim=1)  # [N, dim]
+
+        update_count = 0
+        for r in range(self.num_rel_total):
+            if self.answer_ids[r] is None:
+                self.proto_scores[r].zero_()
+                continue
+
+            ids = self.answer_ids[r].to(device)
+            # Prototype = mean of answer entity embeddings (normalized)
+            proto = all_ent_norm[ids].mean(dim=0)  # [dim]
+            proto = F.normalize(proto, p=2, dim=0)  # normalize prototype
+
+            # Cosine similarity with all entities
+            sim = torch.mv(all_ent_norm, proto)  # [N]
+            self.proto_scores[r] = sim
+            update_count += 1
+
+        if epoch % 10 == 0 or epoch == 0:
+            avg_score = self.proto_scores.mean().item()
+            std_score = self.proto_scores.std().item()
+            logger.info(f"[PrototypeEnhancer] Epoch {epoch}: updated {update_count} prototypes, "
+                        f"avg_sim={avg_score:.4f}, std_sim={std_score:.4f}")
+
+    def forward(self, original_score, query_rel, all_ent, epoch):
+        """
+        Enhance original scores with prototype similarity.
+
+        Args:
+            original_score: [batch, N] raw scores before sigmoid
+            query_rel: [batch] relation indices
+            all_ent: [N, dim] current entity embeddings
+            epoch: current epoch number
+
+        Returns:
+            final_score: [batch, N]
+        """
+        # Build answer sets on first call
         if not self.built:
-            self.build(edge_index=edge_index, edge_type=edge_type, device=device)
+            self.build_answer_sets(
+                self._edge_index, self._edge_type
+            )
 
-        # Lookup pre-computed scores (no gradient through pattern computation)
-        # query_rel: [batch]
-        # rel_pattern_scores: [R, N]
-        pattern_score = self.rel_pattern_scores[query_rel]  # [batch, N], no grad
+        # Update prototypes once per epoch (use detached embeddings)
+        self.update_prototypes(all_ent.detach(), epoch)
 
-        # Only gamma is learnable
-        gamma = torch.sigmoid(self.gamma)  # starts at ~0.05
+        # Lookup pre-computed scores (no gradient)
+        pattern_score = self.proto_scores[query_rel]  # [batch, N]
+
+        # Fusion
+        gamma = torch.sigmoid(self.gamma)
         final_score = original_score + gamma * pattern_score
 
         # Log
@@ -165,9 +149,9 @@ class ReversePathReasoner(nn.Module):
             avg_ps = pattern_score.mean().item()
             boost = (gamma * pattern_score).mean().item()
             orig_mean = original_score.mean().item()
-            logger.info(f"[ReversePathReasoner] Step {self.forward_count}: "
+            logger.info(f"[PrototypeEnhancer] Step {self.forward_count}: "
                         f"gamma={gamma_val:.4f}, "
-                        f"avg_pattern={avg_ps:.4f}, "
+                        f"avg_sim={avg_ps:.4f}, "
                         f"avg_boost={boost:.4f}, "
                         f"orig_mean={orig_mean:.4f}")
 

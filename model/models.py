@@ -43,15 +43,20 @@ class HoGRNBase(BaseModel):
 		self.register_buffer('node_deg', norm_deg)
 		self.register_buffer('node_deg_raw', raw_deg)
 
-		# ===== Reverse Path Reasoning (逆向路径推理) =====
+		# ===== Prototype Enhancement =====
 		if getattr(self.p, 'use_reverse_path', False):
-			from model.rpg_module import ReversePathReasoner
+			from model.rpg_module import PrototypeEnhancer
 
-			self.reverse_path_reasoner = ReversePathReasoner(
+			self.prototype_enhancer = PrototypeEnhancer(
 				num_relations=num_rel,
-				num_ent=self.p.num_ent
+				num_ent=self.p.num_ent,
+				embed_dim=self.p.embed_dim
 			)
-			logger.info(f"[ReversePath] Reverse path reasoning enabled")
+			# Store edge info for deferred build
+			self.prototype_enhancer._edge_index = self.edge_index
+			self.prototype_enhancer._edge_type = self.edge_type
+			self.prototype_enhancer.current_epoch = -1
+			logger.info(f"[Prototype] Prototype enhancement enabled")
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -190,13 +195,14 @@ class HoGRN_ConvE(HoGRNBase):
 		x 		= torch.mm(x, all_ent.transpose(1,0))
 		x 		+= self.bias.expand_as(x)
 
-		# ===== Reverse Path Reasoning (逆向路径推理) =====
+		# ===== Prototype Enhancement =====
 		if getattr(self.p, 'use_reverse_path', False):
-			x = self.reverse_path_reasoner(
+			epoch = getattr(self.p, '_current_epoch', 0)
+			x = self.prototype_enhancer(
 				original_score=x,
 				query_rel=rel,
-				edge_index=self.edge_index,
-				edge_type=self.edge_type
+				all_ent=all_ent,
+				epoch=epoch
 			)
 
 		score	= torch.sigmoid(x)
