@@ -39,6 +39,10 @@ class EdgeSelector(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
 
+        # 额外的关系级别重要性（可学习的先验）
+        # 某些关系可能整体更重要或更不重要
+        self.use_rel_prior = True
+
         # 初始化：让初始输出接近 0.5
         self._init_weights()
 
@@ -46,7 +50,8 @@ class EdgeSelector(nn.Module):
         """初始化权重，使初始 prob 接近 0.5"""
         for m in self.scorer:
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                # 使用较小的初始化，让初始输出接近 0（sigmoid(0) = 0.5）
+                nn.init.xavier_uniform_(m.weight, gain=0.01)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -73,16 +78,40 @@ class EdgeSelector(nn.Module):
 
         return prob
 
+    def forward_with_structure(self, h_src, h_dst, r_emb, src_deg, dst_deg):
+        """
+        结合结构信息计算边重要性
+
+        低度节点的边可能更重要（稀疏节点需要保留更多信息）
+
+        Args:
+            h_src, h_dst, r_emb: 同 forward
+            src_deg: 源节点度数 [num_edges]
+            dst_deg: 目标节点度数 [num_edges]
+
+        Returns:
+            prob: 边重要性概率 [num_edges, 1]
+        """
+        # 基础概率
+        prob = self.forward(h_src, h_dst, r_emb)
+
+        # 度数调整：低度节点的边权重稍微提升
+        # 归一化度数到 [0, 1]
+        deg_factor = 1.0 / (1.0 + 0.1 * (src_deg + dst_deg).unsqueeze(-1).float())
+
+        # 加权组合
+        prob = prob * (1.0 + 0.2 * deg_factor)
+        prob = torch.clamp(prob, 0.0, 1.0)
+
+        return prob
+
     def polarization_loss(self, prob):
         """
-        分化损失：鼓励 prob 趋向 0 或 1
+        分化损失：鼓励 prob 趋向 0 或 1，同时保持稀疏性
 
-        原理: 最小化熵 → 分布变得确定 → prob 趋向极端值
-
-        L = -mean(prob * log(prob) + (1-prob) * log(1-prob))
-
-        当 prob=0.5 时，熵最大，损失最大
-        当 prob=0 或 1 时，熵为 0，损失为 0
+        包含两部分：
+        1. 熵损失：让分布确定（趋向 0 或 1）
+        2. 稀疏损失：鼓励更多边被过滤（趋向 0）
 
         Args:
             prob: 边重要性概率 [num_edges, 1]
@@ -91,10 +120,19 @@ class EdgeSelector(nn.Module):
             loss: 标量损失值
         """
         eps = 1e-8
-        # 负熵
+
+        # 1. 熵损失：鼓励极端化
         entropy = -(prob * torch.log(prob + eps) +
                     (1 - prob) * torch.log(1 - prob + eps))
-        return entropy.mean()
+        entropy_loss = entropy.mean()
+
+        # 2. 稀疏损失：鼓励 prob 趋向 0（过滤更多边）
+        # 但不能太强，否则所有边都被过滤
+        sparse_loss = prob.mean()
+
+        # 组合：熵损失 + 0.5 * 稀疏损失
+        # 稀疏损失权重较小，只起到"打破对称"的作用
+        return entropy_loss + 0.5 * sparse_loss
 
     def get_stats(self, prob):
         """

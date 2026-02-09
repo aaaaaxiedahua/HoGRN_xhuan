@@ -275,6 +275,8 @@ class Runner(object):
 
 			# 添加信息瓶颈损失
 			if getattr(self.p, 'use_ib', False):
+				# 设置当前 epoch（用于 warmup）
+				self.model.ib_loss.set_epoch(epoch)
 				ib_loss, ib_loss_dict = self.model.compute_ib_loss(ib_info)
 				loss += ib_loss
 				ib_losses.append(ib_loss_dict)

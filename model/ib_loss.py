@@ -17,17 +17,32 @@ class IBLoss(nn.Module):
     包含三个部分：
     1. KL 散度损失：压缩表示，最小化 I(X; Z)
     2. 分化损失：让边权重趋向 0 或 1
+
+    支持 warmup：前 N 个 epoch 不加 IB 损失，让模型先学会基本预测
     """
 
-    def __init__(self, beta=0.01, polar_weight=0.1):
+    def __init__(self, beta=0.01, polar_weight=0.1, warmup_epochs=10):
         """
         Args:
             beta: KL 散度损失权重
             polar_weight: 分化损失权重
+            warmup_epochs: warmup 的 epoch 数，期间 IB 损失权重从 0 线性增加
         """
         super().__init__()
         self.beta = beta
         self.polar_weight = polar_weight
+        self.warmup_epochs = warmup_epochs
+        self.current_epoch = 0
+
+    def set_epoch(self, epoch):
+        """设置当前 epoch（用于 warmup）"""
+        self.current_epoch = epoch
+
+    def get_warmup_factor(self):
+        """获取 warmup 系数 [0, 1]"""
+        if self.current_epoch >= self.warmup_epochs:
+            return 1.0
+        return self.current_epoch / self.warmup_epochs
 
     def kl_divergence(self, mu, logvar):
         """
@@ -78,19 +93,31 @@ class IBLoss(nn.Module):
             total_loss: 总损失
             loss_dict: 各项损失的详细信息
         """
+        # 获取 warmup 系数
+        warmup = self.get_warmup_factor()
+
         # KL 散度损失
         kl_loss = self.kl_divergence(mu, logvar)
 
-        # 分化损失
+        # 分化损失（包含稀疏项）
         polar_loss = self.polarization_loss(edge_prob)
 
-        # 总损失
-        total_loss = self.beta * kl_loss + self.polar_weight * polar_loss
+        # 稀疏损失：鼓励更多边被过滤
+        sparse_loss = edge_prob.mean()
+
+        # 总损失（乘以 warmup 系数）
+        total_loss = warmup * (
+            self.beta * kl_loss +
+            self.polar_weight * polar_loss +
+            0.05 * sparse_loss  # 小权重的稀疏损失
+        )
 
         loss_dict = {
             'ib_total': total_loss.item(),
             'kl_loss': kl_loss.item(),
             'polar_loss': polar_loss.item(),
+            'sparse_loss': sparse_loss.item(),
+            'warmup': warmup,
             'beta': self.beta,
             'polar_weight': self.polar_weight
         }

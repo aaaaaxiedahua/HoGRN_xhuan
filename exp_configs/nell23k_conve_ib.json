@@ -16,7 +16,7 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "use_ib": true,
-  "ib_beta": 0.01,
-  "polar_weight": 0.1,
+  "ib_beta": 0.001,
+  "polar_weight": 0.01,
   "edge_selector_hidden": 100
 }
