@@ -266,7 +266,7 @@ class Runner(object):
 			if self.p.sim_decay > 0:
 				loss += self.p.sim_decay * cor
 
-			# 添加因果损失
+			# 添加因果损失（对比学习版）
 			if getattr(self.p, 'use_causal', False):
 				# 设置当前 epoch（用于 warmup）
 				self.model.causal_loss.set_epoch(epoch)
@@ -274,14 +274,15 @@ class Runner(object):
 				# 计算因果损失
 				cf_score = causal_info.get('cf_score')
 				if cf_score is not None:
-					# 反事实损失
+					# 计算反事实损失（BCE）
 					cf_loss = self.model.loss(cf_score, label)
 
-					# 因果损失：原始预测应该比反事实好
+					# 对比因果损失：原始损失应该小于反事实损失
+					# 新接口：直接传入两个损失值
 					causal_loss, causal_loss_dict = self.model.compute_causal_loss(
-						causal_info, pred, cf_score
+						causal_info, loss, cf_loss  # 传入 loss 而非 pred
 					)
-					loss += causal_loss
+					loss = loss + causal_loss  # 使用 = 而非 +=，确保计算图正确
 					causal_losses.append(causal_loss_dict)
 
 			loss.backward()
@@ -292,11 +293,13 @@ class Runner(object):
 
 		# 记录因果损失信息
 		if getattr(self.p, 'use_causal', False) and len(causal_losses) > 0:
-			avg_align = np.mean([d.get('alignment_loss', 0) for d in causal_losses])
-			avg_consist = np.mean([d.get('consistency_loss', 0) for d in causal_losses])
+			avg_contrast = np.mean([d.get('contrastive_loss', 0) for d in causal_losses])
 			avg_sep = np.mean([d.get('separation_loss', 0) for d in causal_losses])
-			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}, Align:{:.4}, Consist:{:.4}, Sep:{:.4}\n'.format(
-				epoch, loss, avg_align, avg_consist, avg_sep))
+			avg_orig_loss = np.mean([d.get('original_loss', 0) for d in causal_losses])
+			avg_cf_loss = np.mean([d.get('cf_loss', 0) for d in causal_losses])
+			avg_warmup = np.mean([d.get('warmup', 0) for d in causal_losses])
+			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}, Contrast:{:.4}, Sep:{:.4}, Orig:{:.4}, CF:{:.4}, Warmup:{:.2f}\n'.format(
+				epoch, loss, avg_contrast, avg_sep, avg_orig_loss, avg_cf_loss, avg_warmup))
 
 			# 每 10 个 epoch 记录因果分数统计
 			if epoch % 10 == 0 and causal_info.get('causal_scores') is not None:
@@ -402,11 +405,14 @@ if __name__ == '__main__':
 
 	# Causal Structure Learning parameters
 	parser.add_argument('-use_causal',      dest='use_causal',      action='store_true',    help='Enable Causal Structure Learning')
-	parser.add_argument('-causal_alpha',    dest='causal_alpha',    default=0.1,   type=float, help='Weight for causal alignment loss')
-	parser.add_argument('-causal_beta',     dest='causal_beta',     default=0.1,   type=float, help='Weight for intervention consistency loss')
-	parser.add_argument('-causal_gamma',    dest='causal_gamma',    default=0.01,  type=float, help='Weight for causal separation loss')
+	parser.add_argument('-causal_alpha',    dest='causal_alpha',    default=0.5,   type=float, help='Weight for contrastive loss (core)')
+	parser.add_argument('-causal_beta',     dest='causal_beta',     default=0.1,   type=float, help='Reserved for compatibility')
+	parser.add_argument('-causal_gamma',    dest='causal_gamma',    default=0.0001,type=float, help='Weight for separation loss (auxiliary)')
+	parser.add_argument('-causal_margin',   dest='causal_margin',   default=0.1,   type=float, help='Margin for contrastive loss')
+	parser.add_argument('-causal_base',     dest='causal_base',     default=0.3,   type=float, help='Base weight for residual connection')
+	parser.add_argument('-causal_scale',    dest='causal_scale',    default=0.7,   type=float, help='Scale for causal score in edge weight')
 	parser.add_argument('-causal_hidden',   dest='causal_hidden',   default=100,   type=int,   help='Hidden dim for causal discovery')
-	parser.add_argument('-causal_warmup',   dest='causal_warmup',   default=10,    type=int,   help='Warmup epochs for causal loss')
+	parser.add_argument('-causal_warmup',   dest='causal_warmup',   default=15,    type=int,   help='Warmup epochs for causal loss')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')

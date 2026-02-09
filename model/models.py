@@ -52,18 +52,26 @@ class HoGRNBase(BaseModel):
 				num_rels=num_rel
 			)
 
-			# 软干预模块
-			self.soft_intervention = SoftIntervention()
+			# 软干预模块（带残差连接）
+			# base_weight=0.3 保证最小信息流，scale=0.7 控制因果分数影响
+			causal_base = getattr(self.p, 'causal_base', 0.3)
+			causal_scale = getattr(self.p, 'causal_scale', 0.7)
+			self.soft_intervention = SoftIntervention(
+				base_weight=causal_base,
+				scale=causal_scale
+			)
 
-			# 因果损失
-			causal_alpha = getattr(self.p, 'causal_alpha', 0.1)
-			causal_beta = getattr(self.p, 'causal_beta', 0.1)
-			causal_gamma = getattr(self.p, 'causal_gamma', 0.01)
-			warmup_epochs = getattr(self.p, 'causal_warmup', 10)
+			# 因果损失（对比学习版）
+			causal_alpha = getattr(self.p, 'causal_alpha', 0.5)   # 对比损失权重
+			causal_beta = getattr(self.p, 'causal_beta', 0.1)     # 保留兼容性
+			causal_gamma = getattr(self.p, 'causal_gamma', 0.0001)  # 分离损失权重（很小）
+			causal_margin = getattr(self.p, 'causal_margin', 0.1)  # 对比损失 margin
+			warmup_epochs = getattr(self.p, 'causal_warmup', 15)
 			self.causal_loss = CausalLoss(
 				alpha=causal_alpha,
 				beta=causal_beta,
 				gamma=causal_gamma,
+				margin=causal_margin,
 				warmup_epochs=warmup_epochs
 			)
 
@@ -184,14 +192,14 @@ class HoGRNBase(BaseModel):
 
 		return sub_emb, rel_emb, x, cor
 
-	def compute_causal_loss(self, causal_info, original_pred, counterfactual_pred):
+	def compute_causal_loss(self, causal_info, original_loss, counterfactual_loss):
 		"""
-		计算因果损失
+		计算因果损失（对比学习版）
 
 		Args:
-			causal_info: 因果信息字典
-			original_pred: 原始预测
-			counterfactual_pred: 反事实预测
+			causal_info: 因果信息字典，包含 causal_scores
+			original_loss: 原始预测的 BCE 损失（标量）
+			counterfactual_loss: 反事实预测的 BCE 损失（标量）
 
 		Returns:
 			causal_loss: 因果损失
@@ -202,14 +210,8 @@ class HoGRNBase(BaseModel):
 
 		causal_scores = causal_info['causal_scores']
 
-		# 构造干预数据（使用反事实作为干预结果）
-		interventions_data = [{
-			'intervened_pred': counterfactual_pred,
-			'intervened_indices': torch.arange(causal_scores.size(0), device=self.device),
-			'strategy': 'counterfactual'
-		}]
-
-		return self.causal_loss(causal_scores, original_pred, interventions_data)
+		# 使用新接口：直接传入损失值
+		return self.causal_loss(causal_scores, original_loss, counterfactual_loss)
 
 
 class HoGRN_TransE(HoGRNBase):

@@ -164,48 +164,74 @@ class InterventionModule(nn.Module):
 
 class SoftIntervention(nn.Module):
     """
-    软干预模块
+    软干预模块（带残差连接）
 
-    不是完全移除边，而是用因果分数作为权重
-    这样可以实现可微分的干预
+    核心改进：
+    - 使用残差连接：edge_weight = base + scale * causal_score
+    - 保证最小信息流，防止因果分数坍塌到 0
+    - 反事实权重与原始权重互补
     """
 
-    def __init__(self, temperature=1.0):
+    def __init__(self, temperature=1.0, base_weight=0.3, scale=0.7):
         """
         Args:
             temperature: 温度参数，控制软干预的"硬度"
+            base_weight: 基础权重（残差），确保最小信息流
+            scale: 缩放因子，控制因果分数的影响范围
         """
         super().__init__()
         self.temperature = temperature
+        self.base_weight = base_weight  # 默认 0.3
+        self.scale = scale              # 默认 0.7
+        # edge_weight 范围: [base_weight, base_weight + scale] = [0.3, 1.0]
 
     def forward(self, causal_scores, hard=False):
         """
-        计算软干预权重
+        计算软干预权重（带残差连接）
+
+        残差设计：edge_weight = base + scale * causal_score
+        - 当 causal_score = 0 时，edge_weight = 0.3（保证最小信息流）
+        - 当 causal_score = 1 时，edge_weight = 1.0（完全保留）
+
+        这样即使分离损失把某些边的因果分数推向 0，
+        信息仍能流通，梯度仍能传播，避免坍塌。
 
         Args:
             causal_scores: 因果分数 [num_edges, 1]
             hard: 是否使用硬干预（Gumbel-Softmax）
 
         Returns:
-            weights: 干预权重 [num_edges, 1]
+            weights: 干预权重 [num_edges, 1]，范围 [base_weight, base_weight+scale]
         """
         if hard:
             # 硬干预：使用 straight-through estimator
             hard_weights = (causal_scores > 0.5).float()
             # 直通估计：前向用硬值，反向用软值的梯度
-            weights = hard_weights - causal_scores.detach() + causal_scores
+            soft_weights = self.base_weight + self.scale * causal_scores
+            hard_weights_scaled = self.base_weight + self.scale * hard_weights
+            weights = hard_weights_scaled - soft_weights.detach() + soft_weights
         else:
-            # 软干预：直接用因果分数作为权重
-            weights = causal_scores
+            # 软干预：残差连接
+            weights = self.base_weight + self.scale * causal_scores
 
         return weights
 
     def counterfactual_weight(self, causal_scores):
         """
-        计算反事实权重
+        计算反事实权重（与原始权重互补）
 
-        反事实：如果因果边不存在会怎样？
-        权重 = 1 - causal_score（因果边被削弱）
+        设计原则：
+        - 原始权重 + 反事实权重 应该恒定（这里设为 1.3）
+        - 原始权重 = 0.3 + 0.7 * causal_score
+        - 反事实权重 = 1.3 - 原始权重 = 1.0 - 0.7 * causal_score
+
+        当 causal_score = 0: 原始=0.3, 反事实=1.0（低因果边反事实更强）
+        当 causal_score = 1: 原始=1.0, 反事实=0.3（高因果边反事实更弱）
+
+        这样保证：
+        - 高因果分数的边：原始权重大，反事实权重小
+        - 低因果分数的边：原始权重小，反事实权重大
+        - 对比损失会推动模型让重要边的因果分数变高
 
         Args:
             causal_scores: 因果分数 [num_edges, 1]
@@ -213,4 +239,6 @@ class SoftIntervention(nn.Module):
         Returns:
             cf_weights: 反事实权重 [num_edges, 1]
         """
-        return 1.0 - causal_scores
+        # 反事实权重 = (base + scale) - scale * causal_score
+        # = 1.0 - 0.7 * causal_score，范围 [0.3, 1.0]
+        return (self.base_weight + self.scale) - self.scale * causal_scores
