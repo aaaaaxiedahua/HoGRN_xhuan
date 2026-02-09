@@ -1,7 +1,7 @@
 {
   "_comment": "Causal-HoGRN for NELL23K with ConvE scorer",
-  "_description": "Causal Structure Learning - Contrastive + Balance",
-  "_design": "softplus contrastive loss + balance regularization to prevent collapse",
+  "_description": "A+C: Clamp替代Sigmoid + 移除熵损失只保留均衡损失",
+  "_design": "Clamp避免梯度饱和，对比损失自然区分边重要性",
   "data": "NELL23K",
   "score_func": "conve",
   "batch": 256,
@@ -18,10 +18,10 @@
   "rel_norm": true,
   "use_causal": true,
   "causal_alpha": 1.0,
-  "causal_gamma": 0.01,
+  "causal_gamma": 0.1,
   "causal_margin": 0.0,
   "causal_base": 0.3,
   "causal_scale": 0.7,
   "causal_hidden": 100,
-  "causal_warmup": 10
+  "causal_warmup": 5
 }

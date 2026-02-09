@@ -53,40 +53,35 @@ class CausalLoss(nn.Module):
 
     def separation_loss(self, causal_scores):
         """
-        分离损失 + 均衡损失
+        均衡损失（移除了熵损失）
 
-        两部分：
-        1. 熵损失：鼓励分数趋向 0 或 1（极化）
-        2. 均衡损失：鼓励分数均值接近 0.5（防止单边坍塌）
+        原问题：熵损失导致分数快速极化到 0/1，sigmoid 饱和，梯度消失
 
-        为什么需要均衡损失？
-        - 如果只有熵损失，所有分数可能都坍塌到 0（或都到 1）
-        - 均衡损失确保有些边分数高，有些边分数低
-        - 这样模型才能学习区分重要边和不重要边
+        新设计：只保留均衡损失
+        - 确保分数均值接近 0.5，防止单边坍塌
+        - 让对比损失自然地区分边的重要性
+        - 不强制极化，保持梯度流动
 
         Args:
             causal_scores: 因果分数 [num_edges, 1]
 
         Returns:
-            loss: 分离损失 + 均衡损失
+            loss: 均衡损失
         """
-        eps = 1e-8
-        scores = causal_scores.squeeze().clamp(eps, 1 - eps)
+        scores = causal_scores.squeeze()
 
-        # 1. 熵损失：鼓励极化
-        entropy = -(scores * torch.log(scores) +
-                    (1 - scores) * torch.log(1 - scores))
-        entropy_loss = entropy.mean()
-
-        # 2. 均衡损失：均值应该接近 0.5
-        # 这防止所有分数都往 0 或都往 1 坍塌
+        # 均衡损失：均值应该接近 0.5
         mean_score = scores.mean()
         balance_loss = (mean_score - 0.5) ** 2
 
-        # 组合：熵损失 + 均衡损失（均衡损失权重更大）
-        # 均衡损失最大值是 0.25（当均值为 0 或 1 时）
-        # 熵损失最大值是 log(2) ≈ 0.693（当分数为 0.5 时）
-        total = entropy_loss + 10.0 * balance_loss
+        # 可选：方差损失，鼓励分数有一定的区分度（不是全都在 0.5）
+        # 目标方差约 0.1，太小说明没区分度，太大说明极化
+        var_score = scores.var()
+        target_var = 0.1
+        var_loss = (var_score - target_var) ** 2
+
+        # 均衡损失为主，方差损失为辅
+        total = balance_loss + 0.1 * var_loss
 
         return total
 
