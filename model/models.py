@@ -211,7 +211,23 @@ class HoGRNBase(BaseModel):
 		causal_scores = causal_info['causal_scores']
 
 		# 使用新接口：直接传入损失值
-		return self.causal_loss(causal_scores, original_loss, counterfactual_loss)
+		causal_loss, loss_dict = self.causal_loss(causal_scores, original_loss, counterfactual_loss)
+
+		# 添加 edge_weight 统计
+		edge_weight = causal_info.get('edge_weight')
+		cf_weight = causal_info.get('cf_weight')
+		if edge_weight is not None:
+			ew = edge_weight.squeeze()
+			loss_dict['ew_mean'] = ew.mean().item()
+			loss_dict['ew_std'] = ew.std().item()
+			loss_dict['ew_min'] = ew.min().item()
+			loss_dict['ew_max'] = ew.max().item()
+		if cf_weight is not None:
+			cw = cf_weight.squeeze()
+			loss_dict['cw_mean'] = cw.mean().item()
+			loss_dict['cw_std'] = cw.std().item()
+
+		return causal_loss, loss_dict
 
 
 class HoGRN_TransE(HoGRNBase):
@@ -246,6 +262,8 @@ class HoGRN_TransE(HoGRNBase):
 
 		causal_info = {
 			'causal_scores': causal_scores,
+			'edge_weight': edge_weight,
+			'cf_weight': cf_weight,
 			'cf_score': cf_score
 		}
 
@@ -286,6 +304,8 @@ class HoGRN_DistMult(HoGRNBase):
 
 		causal_info = {
 			'causal_scores': causal_scores,
+			'edge_weight': edge_weight,
+			'cf_weight': cf_weight,
 			'cf_score': cf_score
 		}
 
@@ -360,6 +380,8 @@ class HoGRN_ConvE(HoGRNBase):
 
 		causal_info = {
 			'causal_scores': causal_scores,
+			'edge_weight': edge_weight,
+			'cf_weight': cf_weight,
 			'cf_score': cf_score
 		}
 

@@ -53,25 +53,42 @@ class CausalLoss(nn.Module):
 
     def separation_loss(self, causal_scores):
         """
-        分离损失：轻微鼓励因果分数趋向 0 或 1
+        分离损失 + 均衡损失
 
-        使用二元熵，但权重应该很小（gamma=0.0001）
-        主要靠对比损失来区分边的重要性
+        两部分：
+        1. 熵损失：鼓励分数趋向 0 或 1（极化）
+        2. 均衡损失：鼓励分数均值接近 0.5（防止单边坍塌）
+
+        为什么需要均衡损失？
+        - 如果只有熵损失，所有分数可能都坍塌到 0（或都到 1）
+        - 均衡损失确保有些边分数高，有些边分数低
+        - 这样模型才能学习区分重要边和不重要边
 
         Args:
             causal_scores: 因果分数 [num_edges, 1]
 
         Returns:
-            loss: 分离损失（熵）
+            loss: 分离损失 + 均衡损失
         """
         eps = 1e-8
         scores = causal_scores.squeeze().clamp(eps, 1 - eps)
 
-        # 二元熵: H(p) = -p*log(p) - (1-p)*log(1-p)
+        # 1. 熵损失：鼓励极化
         entropy = -(scores * torch.log(scores) +
                     (1 - scores) * torch.log(1 - scores))
+        entropy_loss = entropy.mean()
 
-        return entropy.mean()
+        # 2. 均衡损失：均值应该接近 0.5
+        # 这防止所有分数都往 0 或都往 1 坍塌
+        mean_score = scores.mean()
+        balance_loss = (mean_score - 0.5) ** 2
+
+        # 组合：熵损失 + 均衡损失（均衡损失权重更大）
+        # 均衡损失最大值是 0.25（当均值为 0 或 1 时）
+        # 熵损失最大值是 log(2) ≈ 0.693（当分数为 0.5 时）
+        total = entropy_loss + 10.0 * balance_loss
+
+        return total
 
     def contrastive_loss(self, original_loss, counterfactual_loss):
         """
@@ -81,12 +98,15 @@ class CausalLoss(nn.Module):
         - 原始预测使用权重 = 0.3 + 0.7 * causal_score（高因果边权重高）
         - 反事实预测使用权重 = 1.0 - 0.7 * causal_score（高因果边权重低）
         - 如果因果分数正确，原始预测应该更好（损失更小）
-        - 如果原始损失 > 反事实损失，说明因果分数学反了
 
-        Margin Ranking Loss:
-        loss = max(0, original_loss - counterfactual_loss + margin)
+        使用 Softplus 替代 ReLU：
+        - ReLU 的问题：当 orig < cf 时梯度为 0，因果分数无法学习
+        - Softplus 始终有非零梯度，即使 orig < cf 也能传递信号
+        - loss = log(1 + exp(orig - cf + margin))
+        - 当 orig << cf 时，loss ≈ 0（但仍有小梯度）
+        - 当 orig >> cf 时，loss ≈ orig - cf + margin
 
-        当原始损失比反事实损失大时产生正损失，推动模型调整因果分数
+        这样即使模型正确（orig < cf），也有轻微梯度继续优化因果分数
 
         Args:
             original_loss: 原始预测损失（标量）
@@ -95,7 +115,9 @@ class CausalLoss(nn.Module):
         Returns:
             loss: 对比损失
         """
-        loss = F.relu(original_loss - counterfactual_loss + self.margin)
+        # Softplus: 始终有梯度，避免因果分数学习停滞
+        diff = original_loss - counterfactual_loss + self.margin
+        loss = F.softplus(diff)
         return loss
 
     def forward(self, causal_scores, original_loss, counterfactual_loss):
@@ -126,13 +148,29 @@ class CausalLoss(nn.Module):
         # 对比损失是核心，分离损失只是辅助
         total_loss = warmup * (self.alpha * contrast_loss + self.gamma * sep_loss)
 
+        # 详细统计
+        scores = causal_scores.squeeze()
+
         loss_dict = {
             'causal_total': total_loss.item(),
             'contrastive_loss': contrast_loss.item(),
             'separation_loss': sep_loss.item(),
             'original_loss': original_loss.item() if isinstance(original_loss, torch.Tensor) else original_loss,
             'cf_loss': counterfactual_loss.item() if isinstance(counterfactual_loss, torch.Tensor) else counterfactual_loss,
-            'warmup': warmup
+            'loss_diff': (original_loss - counterfactual_loss).item() if isinstance(original_loss, torch.Tensor) else 0,
+            'warmup': warmup,
+            # 因果分数统计
+            'cs_mean': scores.mean().item(),
+            'cs_std': scores.std().item(),
+            'cs_min': scores.min().item(),
+            'cs_max': scores.max().item(),
+            'cs_median': scores.median().item(),
+            # 分布统计
+            'cs_q25': scores.quantile(0.25).item(),
+            'cs_q75': scores.quantile(0.75).item(),
+            'cs_below_0.3': (scores < 0.3).float().mean().item(),
+            'cs_above_0.7': (scores > 0.7).float().mean().item(),
+            'cs_mid_range': ((scores >= 0.3) & (scores <= 0.7)).float().mean().item(),
         }
 
         return total_loss, loss_dict

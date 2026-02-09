@@ -286,6 +286,19 @@ class Runner(object):
 					causal_losses.append(causal_loss_dict)
 
 			loss.backward()
+
+			# 每 50 个 step 检查一次梯度
+			if step % 50 == 0 and getattr(self.p, 'use_causal', False):
+				# 检查因果发现模块的梯度
+				grad_info = []
+				for name, param in self.model.causal_discovery.named_parameters():
+					if param.grad is not None:
+						grad_norm = param.grad.norm().item()
+						grad_info.append(f"{name}:{grad_norm:.6f}")
+				if grad_info and epoch % 5 == 0:
+					self.logger.info('[Epoch:{} Step:{}] Causal Grads: {}'.format(
+						epoch, step, ', '.join(grad_info[:4])))  # 只显示前4个
+
 			self.optimizer.step()
 			losses.append(loss.item())
 
@@ -297,16 +310,45 @@ class Runner(object):
 			avg_sep = np.mean([d.get('separation_loss', 0) for d in causal_losses])
 			avg_orig_loss = np.mean([d.get('original_loss', 0) for d in causal_losses])
 			avg_cf_loss = np.mean([d.get('cf_loss', 0) for d in causal_losses])
+			avg_loss_diff = np.mean([d.get('loss_diff', 0) for d in causal_losses])
 			avg_warmup = np.mean([d.get('warmup', 0) for d in causal_losses])
-			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}, Contrast:{:.4}, Sep:{:.4}, Orig:{:.4}, CF:{:.4}, Warmup:{:.2f}\n'.format(
-				epoch, loss, avg_contrast, avg_sep, avg_orig_loss, avg_cf_loss, avg_warmup))
 
-			# 每 10 个 epoch 记录因果分数统计
-			if epoch % 10 == 0 and causal_info.get('causal_scores') is not None:
-				causal_stats = self.model.causal_discovery.get_stats(causal_info['causal_scores'])
-				self.logger.info('[Epoch:{}]:  Causal Stats: mean={:.3f}, std={:.3f}, high_ratio={:.3f}, very_high={:.3f}, very_low={:.3f}'.format(
-					epoch, causal_stats['causal_mean'], causal_stats['causal_std'],
-					causal_stats['high_causal_ratio'], causal_stats['very_high_ratio'], causal_stats['very_low_ratio']))
+			# 因果分数统计
+			avg_cs_mean = np.mean([d.get('cs_mean', 0) for d in causal_losses])
+			avg_cs_std = np.mean([d.get('cs_std', 0) for d in causal_losses])
+			avg_cs_min = np.mean([d.get('cs_min', 0) for d in causal_losses])
+			avg_cs_max = np.mean([d.get('cs_max', 0) for d in causal_losses])
+			avg_cs_below = np.mean([d.get('cs_below_0.3', 0) for d in causal_losses])
+			avg_cs_above = np.mean([d.get('cs_above_0.7', 0) for d in causal_losses])
+			avg_cs_mid = np.mean([d.get('cs_mid_range', 0) for d in causal_losses])
+
+			self.logger.info('[Epoch:{}]:  Loss:{:.4}, Contrast:{:.4}, Sep:{:.4}'.format(
+				epoch, loss, avg_contrast, avg_sep))
+			self.logger.info('[Epoch:{}]:  Orig:{:.4}, CF:{:.4}, Diff:{:.4}, Warmup:{:.2f}'.format(
+				epoch, avg_orig_loss, avg_cf_loss, avg_loss_diff, avg_warmup))
+			self.logger.info('[Epoch:{}]:  CS: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}'.format(
+				epoch, avg_cs_mean, avg_cs_std, avg_cs_min, avg_cs_max))
+			self.logger.info('[Epoch:{}]:  CS Distribution: <0.3={:.1%}, 0.3-0.7={:.1%}, >0.7={:.1%}\n'.format(
+				epoch, avg_cs_below, avg_cs_mid, avg_cs_above))
+
+			# 每 5 个 epoch 记录更详细的统计
+			if epoch % 5 == 0:
+				# Edge weight 统计
+				avg_ew_mean = np.mean([d.get('ew_mean', 0) for d in causal_losses])
+				avg_ew_std = np.mean([d.get('ew_std', 0) for d in causal_losses])
+				avg_ew_min = np.mean([d.get('ew_min', 0) for d in causal_losses])
+				avg_ew_max = np.mean([d.get('ew_max', 0) for d in causal_losses])
+				avg_cw_mean = np.mean([d.get('cw_mean', 0) for d in causal_losses])
+
+				self.logger.info('[Epoch:{}]:  EdgeWeight: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}'.format(
+					epoch, avg_ew_mean, avg_ew_std, avg_ew_min, avg_ew_max))
+				self.logger.info('[Epoch:{}]:  CF_Weight: mean={:.4f}'.format(epoch, avg_cw_mean))
+
+				if causal_info.get('causal_scores') is not None:
+					causal_stats = self.model.causal_discovery.get_stats(causal_info['causal_scores'])
+					self.logger.info('[Epoch:{}]:  Detailed Stats: mean={:.4f}, std={:.4f}, high_ratio={:.3f}, very_high={:.3f}, very_low={:.3f}'.format(
+						epoch, causal_stats['causal_mean'], causal_stats['causal_std'],
+						causal_stats['high_causal_ratio'], causal_stats['very_high_ratio'], causal_stats['very_low_ratio']))
 		else:
 			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
 

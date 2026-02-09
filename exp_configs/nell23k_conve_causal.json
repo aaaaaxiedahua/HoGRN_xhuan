@@ -1,7 +1,7 @@
 {
   "_comment": "Causal-HoGRN for NELL23K with ConvE scorer",
-  "_description": "Causal Structure Learning - Contrastive Learning + Residual Connection",
-  "_design": "edge_weight = 0.3 + 0.7 * causal_score, contrastive loss: orig_loss < cf_loss",
+  "_description": "Causal Structure Learning - Contrastive + Balance",
+  "_design": "softplus contrastive loss + balance regularization to prevent collapse",
   "data": "NELL23K",
   "score_func": "conve",
   "batch": 256,
@@ -17,11 +17,11 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "use_causal": true,
-  "causal_alpha": 0.5,
-  "causal_gamma": 0.0001,
-  "causal_margin": 0.1,
+  "causal_alpha": 1.0,
+  "causal_gamma": 0.01,
+  "causal_margin": 0.0,
   "causal_base": 0.3,
   "causal_scale": 0.7,
   "causal_hidden": 100,
-  "causal_warmup": 15
+  "causal_warmup": 10
 }
