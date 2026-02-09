@@ -33,31 +33,32 @@ class CausalDiscovery(nn.Module):
         self.dim = dim
         self.num_rels = num_rels
 
-        # 边级别因果强度评估器
-        # 输入: [h_src || r_edge || h_dst || structure_feat]
+        # 简化的边级别因果强度评估器
+        # 使用 Tanh 而非 ReLU，避免信号被截断
         self.edge_scorer = nn.Sequential(
             nn.Linear(dim * 3 + 2, hidden_dim),  # +2 for degree features
             nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 1)
+            nn.Tanh(),  # Tanh 保持信号流动，输出在 [-1, 1]
+            nn.Linear(hidden_dim, 1)
         )
 
         # 关系级别因果先验（可学习）
-        # 某些关系类型本身可能更具因果性
         if num_rels is not None:
             self.rel_causal_prior = nn.Parameter(torch.zeros(num_rels * 2))
 
         self._init_weights()
 
     def _init_weights(self):
-        """初始化权重"""
-        for m in self.edge_scorer:
+        """初始化权重，使初始因果分数接近 0.5"""
+        for i, m in enumerate(self.edge_scorer):
             if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                if m.bias is not None:
+                if i == len(self.edge_scorer) - 1:
+                    # 最后一层：小权重 + 零偏置，确保输出接近 0
+                    nn.init.xavier_uniform_(m.weight, gain=0.01)
+                    nn.init.zeros_(m.bias)
+                else:
+                    # 中间层：正常初始化
+                    nn.init.xavier_uniform_(m.weight, gain=1.0)
                     nn.init.zeros_(m.bias)
 
     def forward(self, h_src, h_dst, r_emb, edge_type=None, src_deg=None, dst_deg=None):
@@ -80,7 +81,6 @@ class CausalDiscovery(nn.Module):
 
         # 度数特征（归一化）
         if src_deg is not None and dst_deg is not None:
-            # 低度节点的边可能更具因果性（信息更稀缺）
             deg_feat = torch.stack([
                 1.0 / (1.0 + src_deg.float()),
                 1.0 / (1.0 + dst_deg.float())
@@ -118,36 +118,3 @@ class CausalDiscovery(nn.Module):
                 'very_low_ratio': (score_flat < 0.2).float().mean().item(),
             }
         return stats
-
-
-class RelationCausalPrior(nn.Module):
-    """
-    关系级别因果先验模块
-
-    学习每种关系类型的整体因果倾向
-    """
-
-    def __init__(self, num_rels, dim):
-        super().__init__()
-        self.num_rels = num_rels
-
-        # 关系因果嵌入
-        self.rel_causal_embed = nn.Parameter(torch.zeros(num_rels * 2, dim))
-        nn.init.normal_(self.rel_causal_embed, std=0.01)
-
-        # 因果强度投影
-        self.causal_proj = nn.Linear(dim, 1)
-
-    def forward(self, edge_type):
-        """
-        获取关系级别的因果先验
-
-        Args:
-            edge_type: 边类型 [num_edges]
-
-        Returns:
-            rel_causal: 关系因果先验 [num_edges, 1]
-        """
-        rel_embed = self.rel_causal_embed[edge_type]
-        rel_causal = torch.sigmoid(self.causal_proj(rel_embed))
-        return rel_causal

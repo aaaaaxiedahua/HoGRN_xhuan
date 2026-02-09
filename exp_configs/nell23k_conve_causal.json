@@ -1,6 +1,6 @@
 {
   "_comment": "Causal-HoGRN for NELL23K with ConvE scorer",
-  "_description": "Causal Structure Learning enhanced HoGRN - learn causal vs confounding edges",
+  "_description": "Causal Structure Learning - simplified design, let prediction loss guide causal scores",
   "data": "NELL23K",
   "score_func": "conve",
   "batch": 256,
@@ -16,9 +16,9 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "use_causal": true,
-  "causal_alpha": 0.1,
-  "causal_beta": 0.1,
-  "causal_gamma": 0.01,
+  "causal_alpha": 0.0,
+  "causal_beta": 0.0,
+  "causal_gamma": 0.001,
   "causal_hidden": 100,
-  "causal_warmup": 15
+  "causal_warmup": 20
 }

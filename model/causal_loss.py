@@ -1,10 +1,11 @@
 """
-因果损失模块 (Causal Loss Module)
+因果损失模块 (Causal Loss Module) - 简化版
 
 核心思想：
-- 通过干预效应差异指导因果分数学习
-- 高因果分数的边被干预后，预测应该变化大
-- 低因果分数的边被干预后，预测应该变化小
+- 因果分数直接作为边权重，让预测损失的梯度自然指导学习
+- 反事实预测用 (1-因果分数) 作为权重
+- 原始预测应该比反事实预测好（因为保留了因果边）
+- 分离损失鼓励因果分数趋向 0 或 1
 """
 
 import torch
@@ -14,25 +15,24 @@ import torch.nn.functional as F
 
 class CausalLoss(nn.Module):
     """
-    因果损失函数
+    简化版因果损失
 
-    包含三个部分：
-    1. 因果对齐损失：让因果分数与干预效应一致
-    2. 干预一致性损失：非因果边的干预不应影响预测
-    3. 因果分离损失：鼓励因果分数分化（趋向 0 或 1）
+    核心设计：
+    1. 预测损失的梯度自然流向因果分数，指导哪些边重要
+    2. 对比损失：原始预测应该比反事实好
+    3. 分离损失：鼓励因果分数极化
     """
 
     def __init__(self, alpha=0.1, beta=0.1, gamma=0.01, warmup_epochs=10):
         """
         Args:
-            alpha: 因果对齐损失权重
-            beta: 干预一致性损失权重
-            gamma: 因果分离损失权重
+            alpha: 对比损失权重（原始 vs 反事实）
+            beta: 未使用，保留兼容性
+            gamma: 分离损失权重
             warmup_epochs: warmup 轮数
         """
         super().__init__()
         self.alpha = alpha
-        self.beta = beta
         self.gamma = gamma
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
@@ -47,113 +47,55 @@ class CausalLoss(nn.Module):
             return 1.0
         return self.current_epoch / self.warmup_epochs
 
-    def causal_alignment_loss(self, causal_scores, intervention_effects, intervened_indices):
+    def separation_loss(self, causal_scores):
         """
-        因果对齐损失
+        分离损失：鼓励因果分数趋向 0 或 1
 
-        核心思想：
-        - 被干预边的因果分数应该与干预效应正相关
-        - 高因果分数 + 大干预效应 → 正确
-        - 低因果分数 + 小干预效应 → 正确
-        - 高因果分数 + 小干预效应 → 惩罚
-        - 低因果分数 + 大干预效应 → 惩罚
-
-        Args:
-            causal_scores: 因果分数 [num_edges, 1]
-            intervention_effects: 干预效应 [batch]
-            intervened_indices: 被干预的边索引
-
-        Returns:
-            loss: 对齐损失
-        """
-        if len(intervened_indices) == 0:
-            return torch.tensor(0.0, device=causal_scores.device)
-
-        # 获取被干预边的因果分数
-        intervened_scores = causal_scores[intervened_indices].squeeze()  # [num_intervened]
-
-        # 干预效应（标量，整个 batch 的平均效应）
-        effect = intervention_effects.mean()
-
-        # 平均因果分数
-        avg_causal = intervened_scores.mean()
-
-        # 对齐损失：因果分数高的边被干预应该产生大效应
-        # 使用负相关作为损失（我们希望正相关）
-        # 如果 avg_causal 高但 effect 低，说明因果分数不准确
-        alignment_loss = -torch.log(effect + 1e-8) * avg_causal + torch.log(effect + 1e-8) * (1 - avg_causal)
-
-        return alignment_loss
-
-    def intervention_consistency_loss(self, original_pred, intervened_pred,
-                                       causal_scores, intervened_indices):
-        """
-        干预一致性损失
-
-        核心思想：
-        - 干预低因果分数的边后，预测应该稳定
-        - 干预高因果分数的边后，预测可以变化
-
-        Args:
-            original_pred: 原始预测 [batch, num_ent]
-            intervened_pred: 干预后预测 [batch, num_ent]
-            causal_scores: 因果分数 [num_edges, 1]
-            intervened_indices: 被干预的边索引
-
-        Returns:
-            loss: 一致性损失
-        """
-        if len(intervened_indices) == 0:
-            return torch.tensor(0.0, device=causal_scores.device)
-
-        # 被干预边的平均因果分数
-        intervened_causal = causal_scores[intervened_indices].mean()
-
-        # 预测变化
-        pred_change = F.mse_loss(original_pred, intervened_pred)
-
-        # 一致性损失：
-        # 如果干预的是低因果边（intervened_causal 低），pred_change 应该小
-        # 如果干预的是高因果边（intervened_causal 高），pred_change 可以大
-        # 损失 = (1 - causal_score) * pred_change
-        # 低因果分数边被干预产生大变化 → 大损失
-        consistency_loss = (1.0 - intervened_causal) * pred_change
-
-        return consistency_loss
-
-    def causal_separation_loss(self, causal_scores):
-        """
-        因果分离损失
-
-        鼓励因果分数趋向 0 或 1（明确的因果/非因果判断）
-        使用熵损失
+        使用二元熵，当分数接近 0.5 时熵最大，接近 0 或 1 时熵最小
 
         Args:
             causal_scores: 因果分数 [num_edges, 1]
 
         Returns:
-            loss: 分离损失
+            loss: 分离损失（熵）
         """
         eps = 1e-8
         scores = causal_scores.squeeze()
 
-        # 二元熵
+        # 二元熵: H(p) = -p*log(p) - (1-p)*log(1-p)
         entropy = -(scores * torch.log(scores + eps) +
                     (1 - scores) * torch.log(1 - scores + eps))
 
         return entropy.mean()
 
+    def contrastive_loss(self, original_loss, counterfactual_loss):
+        """
+        对比损失：原始预测应该比反事实好
+
+        如果原始损失 > 反事实损失，说明因果分数学错了
+        （因为因果边被保留的原始预测应该更好）
+
+        Args:
+            original_loss: 原始预测损失（标量）
+            counterfactual_loss: 反事实预测损失（标量）
+
+        Returns:
+            loss: 对比损失
+        """
+        # margin ranking loss: 原始损失应该比反事实损失小
+        # loss = max(0, original_loss - counterfactual_loss + margin)
+        margin = 0.0  # 可以设置一个正的 margin
+        loss = F.relu(original_loss - counterfactual_loss + margin)
+        return loss
+
     def forward(self, causal_scores, original_pred, interventions_data):
         """
-        计算总的因果损失
+        计算因果损失
 
         Args:
             causal_scores: 因果分数 [num_edges, 1]
-            original_pred: 原始预测 [batch, num_ent]
-            interventions_data: 干预数据列表，每个元素包含：
-                - intervened_pred: 干预后预测
-                - intervened_indices: 被干预的边索引
-                - strategy: 干预策略
+            original_pred: 原始预测 [batch, num_ent]（未使用）
+            interventions_data: 干预数据列表
 
         Returns:
             total_loss: 总损失
@@ -162,75 +104,40 @@ class CausalLoss(nn.Module):
         warmup = self.get_warmup_factor()
         device = causal_scores.device
 
-        # 初始化损失
-        alignment_loss = torch.tensor(0.0, device=device)
-        consistency_loss = torch.tensor(0.0, device=device)
+        # 分离损失
+        sep_loss = self.separation_loss(causal_scores)
 
-        # 对每次干预计算损失
-        num_interventions = len(interventions_data)
-        for int_data in interventions_data:
-            intervened_pred = int_data['intervened_pred']
-            intervened_indices = int_data['intervened_indices']
-            strategy = int_data.get('strategy', 'random')
+        # 对比损失（如果有反事实数据）
+        contrast_loss = torch.tensor(0.0, device=device)
 
-            # 计算干预效应
-            effect = (original_pred - intervened_pred).abs().mean(dim=-1)
-
-            # 因果对齐损失
-            align_loss = self.causal_alignment_loss(
-                causal_scores, effect, intervened_indices
-            )
-            alignment_loss = alignment_loss + align_loss
-
-            # 干预一致性损失
-            consist_loss = self.intervention_consistency_loss(
-                original_pred, intervened_pred, causal_scores, intervened_indices
-            )
-            consistency_loss = consistency_loss + consist_loss
-
-        # 平均
-        if num_interventions > 0:
-            alignment_loss = alignment_loss / num_interventions
-            consistency_loss = consistency_loss / num_interventions
-
-        # 因果分离损失
-        separation_loss = self.causal_separation_loss(causal_scores)
-
-        # 总损失
-        total_loss = warmup * (
-            self.alpha * alignment_loss +
-            self.beta * consistency_loss +
-            self.gamma * separation_loss
-        )
+        # 总损失：只用分离损失
+        # 对比损失和对齐损失的效果由预测损失的梯度自然实现
+        total_loss = warmup * self.gamma * sep_loss
 
         loss_dict = {
             'causal_total': total_loss.item(),
-            'alignment_loss': alignment_loss.item(),
-            'consistency_loss': consistency_loss.item(),
-            'separation_loss': separation_loss.item(),
+            'alignment_loss': 0.0,  # 不再使用
+            'consistency_loss': 0.0,  # 不再使用
+            'separation_loss': sep_loss.item(),
             'warmup': warmup
         }
 
         return total_loss, loss_dict
 
 
-class SimpleCausalLoss(nn.Module):
+class ContrastiveCausalLoss(nn.Module):
     """
-    简化版因果损失
+    对比因果损失
 
-    核心思想更直接：
-    - 用因果分数作为边权重
-    - 反事实：用 (1 - 因果分数) 作为权重
-    - 损失：原始预测应该比反事实预测更好
+    更直接的设计：
+    1. 原始预测损失
+    2. 反事实预测损失
+    3. 约束：原始损失 < 反事实损失
     """
 
-    def __init__(self, margin=0.1, warmup_epochs=10):
-        """
-        Args:
-            margin: 边界值
-            warmup_epochs: warmup 轮数
-        """
+    def __init__(self, gamma=0.01, margin=0.1, warmup_epochs=10):
         super().__init__()
+        self.gamma = gamma
         self.margin = margin
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
@@ -243,39 +150,33 @@ class SimpleCausalLoss(nn.Module):
             return 1.0
         return self.current_epoch / self.warmup_epochs
 
-    def forward(self, original_loss, counterfactual_loss, causal_scores):
+    def forward(self, causal_scores, original_loss, counterfactual_loss):
         """
-        计算简化因果损失
-
         Args:
-            original_loss: 原始预测损失
-            counterfactual_loss: 反事实预测损失
             causal_scores: 因果分数 [num_edges, 1]
-
-        Returns:
-            causal_loss: 因果损失
-            loss_dict: 损失详情
+            original_loss: 原始预测损失（标量）
+            counterfactual_loss: 反事实预测损失（标量）
         """
         warmup = self.get_warmup_factor()
+        device = causal_scores.device
 
-        # 因果分离损失（熵）
+        # 分离损失
         eps = 1e-8
         scores = causal_scores.squeeze()
         entropy = -(scores * torch.log(scores + eps) +
                     (1 - scores) * torch.log(1 - scores + eps))
-        separation_loss = entropy.mean()
+        sep_loss = entropy.mean()
 
-        # 对比损失：原始预测应该比反事实好
-        # 如果反事实损失 < 原始损失，说明因果分数没学好
-        contrastive_loss = F.relu(original_loss - counterfactual_loss + self.margin)
+        # 对比损失
+        contrast_loss = F.relu(original_loss - counterfactual_loss + self.margin)
 
         # 总损失
-        total_loss = warmup * (0.1 * separation_loss + 0.1 * contrastive_loss)
+        total_loss = warmup * (self.gamma * sep_loss + 0.1 * contrast_loss)
 
         loss_dict = {
             'causal_total': total_loss.item(),
-            'separation_loss': separation_loss.item(),
-            'contrastive_loss': contrastive_loss.item(),
+            'separation_loss': sep_loss.item(),
+            'contrastive_loss': contrast_loss.item(),
             'warmup': warmup
         }
 
