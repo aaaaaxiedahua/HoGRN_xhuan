@@ -22,7 +22,7 @@ class HoGRNConv(MessagePassing):
 		self.bn			= torch.nn.BatchNorm1d(out_channels)
 
 		if self.p.bias: self.register_parameter('bias', Parameter(torch.zeros(out_channels)))
-		if self.p.rel_norm: self.rel_norm = nn.LayerNorm(out_channels, elementwise_affine=False) 
+		if self.p.rel_norm: self.rel_norm = nn.LayerNorm(out_channels, elementwise_affine=False)
 
 		# For relation reasoning
 		if self.p.rel_reason:
@@ -47,11 +47,7 @@ class HoGRNConv(MessagePassing):
 			edge_index: 边索引 [2, num_edges*2] (包含正向和反向边)
 			edge_type: 边类型 [num_edges*2]
 			rel_embed: 关系嵌入 [num_rels*2, in_channels]
-			edge_weight: 边权重 [num_edges*2, 1]，可选，用于信息瓶颈的软过滤
-
-		Returns:
-			out: 更新后的节点特征 [num_nodes, out_channels]
-			rel_embed: 更新后的关系嵌入 [num_rels*2, out_channels]
+			edge_weight: 边权重 [num_edges*2, 1]，可选，用于因果加权
 		"""
 		if self.device is None:
 			self.device = edge_index.device
@@ -91,7 +87,7 @@ class HoGRNConv(MessagePassing):
 		elif self.p.act_type == 'softmax':
 			in_res		= self.propagate('add', self.in_index,   x=x, edge_type=self.in_type,   rel_embed=rel_embed, edge_norm=None, edge_weight=self.in_weight)
 			out_res		= self.propagate('add', self.out_index,  x=x, edge_type=self.out_type,  rel_embed=rel_embed, edge_norm=None, edge_weight=self.out_weight)
-			out			= self.drop(in_res)*(1/2) + self.drop(out_res)*(1/2) 
+			out			= self.drop(in_res)*(1/2) + self.drop(out_res)*(1/2)
 
 		if self.p.bias: out = out + self.bias
 
@@ -99,7 +95,7 @@ class HoGRNConv(MessagePassing):
 			rel_embed = self.rel_reason(rel_embed)
 			if self.p.rel_norm:
 				rel_embed = self.rel_norm(rel_embed)
-		
+
 		return self.bn(out), rel_embed[:-1]
 
 	def rel_transform(self, ent_embed, rel_embed):
@@ -135,7 +131,7 @@ class HoGRNConv(MessagePassing):
 			edge_type: 边类型
 			rel_embed: 关系嵌入
 			edge_norm: 归一化系数
-			edge_weight: 边权重（信息瓶颈软过滤）
+			edge_weight: 边权重（因果加权）
 		"""
 		rel_emb		= torch.index_select(rel_embed, 0, edge_type)
 		xi_rel		= self.rel_transform(x_i, rel_emb)
@@ -151,7 +147,7 @@ class HoGRNConv(MessagePassing):
 		if edge_norm is not None:
 			out = out * edge_norm.view(-1, 1)
 
-		# 应用边权重（信息瓶颈软过滤）
+		# 应用因果权重
 		if edge_weight is not None:
 			out = out * edge_weight
 
@@ -166,12 +162,12 @@ class HoGRNConv(MessagePassing):
 		deg			= scatter_add(edge_weight, row, dim=0, dim_size=num_ent)	# Summing number of weights of the edges
 		deg_inv		= deg.pow(-0.5)							# D^{-0.5}
 		deg_inv[deg_inv	== float('inf')] = 0
-		norm		= deg_inv[row] * edge_weight * deg_inv[col]		
+		norm		= deg_inv[row] * edge_weight * deg_inv[col]
 
 		return norm
 
 	def softmax_sp(self, src, index, num_nodes):
-		out = src - scatter_max(src, index, dim=0, dim_size=num_nodes)[0][index] 
+		out = src - scatter_max(src, index, dim=0, dim_size=num_nodes)[0][index]
 		out = out.exp()
 		out = out / (
 			scatter_add(out, index, dim=0, dim_size=num_nodes)[index] + 1e-16)

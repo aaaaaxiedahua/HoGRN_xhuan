@@ -6,7 +6,7 @@ class Runner(object):
 
 	def load_data(self):
 		"""
-		Read in raw triplets and convert them into a standard format. 
+		Read in raw triplets and convert them into a standard format.
 		"""
 
 		# Build the mapping table from all the data
@@ -37,7 +37,7 @@ class Runner(object):
 
 		# Use UIDs to represent entities and relationships in the data, and inverse relationships are used to expand the training set
 		self.data = ddict(list)
-		sr2o = ddict(set) 
+		sr2o = ddict(set)
 		for split in ['train', 'test', 'valid']:
 			for line in open('./data/{}/{}.txt'.format(self.p.dataset, split)):
 				if self.p.dataset == 'FB15k-237' or self.p.dataset == 'WN18RR':
@@ -47,11 +47,11 @@ class Runner(object):
 				sub, rel, obj = self.ent2id[sub], self.rel2id[rel], self.ent2id[obj]
 				self.data[split].append((sub, rel, obj))
 
-				if split == 'train': 
+				if split == 'train':
 					sr2o[(sub, rel)].add(obj)
 					sr2o[(obj, rel+self.p.num_rel)].add(sub)
 
-		self.data = dict(self.data) 
+		self.data = dict(self.data)
 
 		self.sr2o = {k: list(v) for k, v in sr2o.items()} # train
 		for split in ['test', 'valid']:
@@ -66,7 +66,7 @@ class Runner(object):
 			self.triples['train'].append({'triple':(sub, rel, -1), 'label': self.sr2o[(sub, rel)], 'sub_samp': 1})
 
 		for split in ['test', 'valid']:
-			for sub, rel, obj in self.data[split]: 
+			for sub, rel, obj in self.data[split]:
 				rel_inv = rel + self.p.num_rel
 				self.triples['{}_{}'.format(split, 'tail')].append({'triple': (sub, rel, obj), 	   'label': self.sr2o_all[(sub, rel)]})
 				self.triples['{}_{}'.format(split, 'head')].append({'triple': (obj, rel_inv, sub), 'label': self.sr2o_all[(obj, rel_inv)]})
@@ -92,8 +92,6 @@ class Runner(object):
 
 		self.edge_index, self.edge_type = self.construct_adj()
 
-		# Reverse Path Reasoning 不需要离线路径挖掘，直接使用 edge_index/edge_type 在首次 forward 时构建
-
 	def construct_adj(self):
 		"""
 		Construct the adjacency matrix for GCN.
@@ -113,7 +111,7 @@ class Runner(object):
 		edge_type	= torch.LongTensor(edge_type). to(self.device)
 
 		return edge_index, edge_type
-	
+
 	def __init__(self, params):
 		"""
 		Constructor of the runner class.
@@ -189,7 +187,7 @@ class Runner(object):
 		state				= torch.load(load_path)
 		state_dict			= state['state_dict']
 		self.best_val		= state['best_val']
-		self.best_val_mrr	= self.best_val['mrr'] 
+		self.best_val_mrr	= self.best_val['mrr']
 
 		self.model.load_state_dict(state_dict)
 		self.optimizer.load_state_dict(state['optimizer'])
@@ -202,7 +200,7 @@ class Runner(object):
 		----------
 		split: (string) If split == 'valid' then evaluate on the validation set, else the test set
 		epoch: (int) Current epoch count
-		
+
 		Returns
 		-------
 		resutls:			The evaluation results containing the following:
@@ -216,8 +214,6 @@ class Runner(object):
 		results       = get_combined_results(left_results, right_results)
 		self.logger.info('[Epoch {} {}]: MRR: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, results['left_mrr'], results['right_mrr'], results['mrr']))
 		self.logger.info('[Epoch {} {}]: MR: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, results['left_mr'], results['right_mr'], results['mr']))
-		# for k in range(10):
-		# 	self.logger.info('[Epoch {} {}]: Hit@{}: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, k+1, results['left_hits@{}'.format(k+1)], results['right_hits@{}'.format(k+1)], results['hits@{}'.format(k+1)]))
 		if split == 'test':
 			for k in range(10):
 				self.logger.info('[Epoch {} {}]: Hit@{}: Tail : {:.5}, Head : {:.5}, Avg : {:.5}'.format(epoch, split, k+1, results['left_hits@{}'.format(k+1)], results['right_hits@{}'.format(k+1)], results['hits@{}'.format(k+1)]))
@@ -235,7 +231,7 @@ class Runner(object):
 
 			for step, batch in enumerate(train_iter):
 				sub, rel, obj, label	= self.read_batch(batch, split)
-				pred, _, _		= self.model.forward(sub, rel)  # 增加了 ib_info 返回值
+				pred, _, _	= self.model.forward(sub, rel)  # 增加了 causal_info 返回值
 				b_range			= torch.arange(pred.size()[0], device=self.device)
 				target_pred		= pred[b_range, obj]
 				pred 			= torch.where(label.byte(), -torch.ones_like(pred) * 10000000, pred)
@@ -249,9 +245,6 @@ class Runner(object):
 				for k in range(10):
 					results['hits@{}'.format(k+1)] = torch.numel(ranks[ranks <= (k+1)]) + results.get('hits@{}'.format(k+1), 0.0)
 
-				# if step % 100 == 0:
-				# 	self.logger.info('[{}, {} Step {}]'.format(split.title(), mode.title(), step))
-
 		return results
 
 	def run_epoch(self, epoch, val_mrr = 0):
@@ -260,49 +253,57 @@ class Runner(object):
 		"""
 		self.model.train()
 		losses = []
-		ib_losses = []
+		causal_losses = []
 		train_iter = iter(self.data_iter['train'])
 
 		for step, batch in enumerate(train_iter):
 			self.optimizer.zero_grad()
 			sub, rel, obj, label = self.read_batch(batch, 'train')
 
-			pred, cor, ib_info = self.model.forward(sub, rel)
+			pred, cor, causal_info = self.model.forward(sub, rel)
 			loss = self.model.loss(pred, label)
 
 			if self.p.sim_decay > 0:
 				loss += self.p.sim_decay * cor
 
-			# 添加信息瓶颈损失
-			if getattr(self.p, 'use_ib', False):
+			# 添加因果损失
+			if getattr(self.p, 'use_causal', False):
 				# 设置当前 epoch（用于 warmup）
-				self.model.ib_loss.set_epoch(epoch)
-				ib_loss, ib_loss_dict = self.model.compute_ib_loss(ib_info)
-				loss += ib_loss
-				ib_losses.append(ib_loss_dict)
+				self.model.causal_loss.set_epoch(epoch)
+
+				# 计算因果损失
+				cf_score = causal_info.get('cf_score')
+				if cf_score is not None:
+					# 反事实损失
+					cf_loss = self.model.loss(cf_score, label)
+
+					# 因果损失：原始预测应该比反事实好
+					causal_loss, causal_loss_dict = self.model.compute_causal_loss(
+						causal_info, pred, cf_score
+					)
+					loss += causal_loss
+					causal_losses.append(causal_loss_dict)
 
 			loss.backward()
 			self.optimizer.step()
 			losses.append(loss.item())
 
-			# if step % 100 == 0:
-			# 	self.logger.info('[E:{}| {}]: Train Loss:{:.5}'.format(epoch, step, np.mean(losses)))
-
 		loss = np.mean(losses)
 
-		# 记录 IB 损失信息
-		if getattr(self.p, 'use_ib', False) and len(ib_losses) > 0:
-			avg_kl = np.mean([d.get('kl_loss', 0) for d in ib_losses])
-			avg_polar = np.mean([d.get('polar_loss', 0) for d in ib_losses])
-			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}, KL:{:.4}, Polar:{:.4}\n'.format(
-				epoch, loss, avg_kl, avg_polar))
+		# 记录因果损失信息
+		if getattr(self.p, 'use_causal', False) and len(causal_losses) > 0:
+			avg_align = np.mean([d.get('alignment_loss', 0) for d in causal_losses])
+			avg_consist = np.mean([d.get('consistency_loss', 0) for d in causal_losses])
+			avg_sep = np.mean([d.get('separation_loss', 0) for d in causal_losses])
+			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}, Align:{:.4}, Consist:{:.4}, Sep:{:.4}\n'.format(
+				epoch, loss, avg_align, avg_consist, avg_sep))
 
-			# 每 10 个 epoch 记录边选择统计信息
-			if epoch % 10 == 0 and ib_info['edge_prob'] is not None:
-				edge_stats = self.model.edge_selector.get_stats(ib_info['edge_prob'])
-				self.logger.info('[Epoch:{}]:  Edge Stats: mean={:.3f}, std={:.3f}, high_ratio={:.3f}, very_high={:.3f}, very_low={:.3f}'.format(
-					epoch, edge_stats['prob_mean'], edge_stats['prob_std'],
-					edge_stats['high_prob_ratio'], edge_stats['very_high_ratio'], edge_stats['very_low_ratio']))
+			# 每 10 个 epoch 记录因果分数统计
+			if epoch % 10 == 0 and causal_info.get('causal_scores') is not None:
+				causal_stats = self.model.causal_discovery.get_stats(causal_info['causal_scores'])
+				self.logger.info('[Epoch:{}]:  Causal Stats: mean={:.3f}, std={:.3f}, high_ratio={:.3f}, very_high={:.3f}, very_low={:.3f}'.format(
+					epoch, causal_stats['causal_mean'], causal_stats['causal_std'],
+					causal_stats['high_causal_ratio'], causal_stats['very_high_ratio'], causal_stats['very_low_ratio']))
 		else:
 			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
 
@@ -320,7 +321,6 @@ class Runner(object):
 			self.logger.info('Successfully Loaded previous model')
 
 		kill_cnt = 0
-		# for epoch in range(1):
 		for epoch in range(self.p.max_epochs):
 			print("########")
 			t0 = time.time()
@@ -328,7 +328,7 @@ class Runner(object):
 			print("Time cost in one epoch for training: {:.4f}s".format((time.time()-t0)/60))
 
 			val_results = self.evaluate('valid', epoch)
-			
+
 			if val_results['mrr'] > self.best_val_mrr:
 				self.best_val	   = val_results
 				self.best_val_mrr  = val_results['mrr']
@@ -338,14 +338,13 @@ class Runner(object):
 			else:
 				kill_cnt += 1
 				if kill_cnt % 10 == 0 and self.p.gamma > 5:
-					self.p.gamma -= 5 
+					self.p.gamma -= 5
 					self.logger.info('Gamma decay on saturation, updated value of gamma: {}'.format(self.p.gamma))
-				if kill_cnt > 25: 
+				if kill_cnt > 25:
 					self.logger.info("Early Stopping!!")
 					break
 
 			self.logger.info('[Epoch {}]: Training Loss: {:.5}, Best Valid MRR: {:.5}\n\n'.format(epoch, train_loss, self.best_val_mrr))
-			# print("Total time cost in one epoch: {:.4f}s".format((time.time()-t0)/60))
 
 		self.logger.info('Loading best model, Evaluating on Test data')
 		self.load_model(save_path)
@@ -368,7 +367,7 @@ if __name__ == '__main__':
 	parser.add_argument('-epoch',		dest='max_epochs',	type=int,	default=9999,  	help='Number of epochs')
 	parser.add_argument('-gamma',		dest='gamma',		type=float,	default=40,		help='Margin')
 	parser.add_argument('-gpu',			type=str,			default='0',				help='Set GPU Ids : Eg: For CPU = -1, For Single GPU = 0')
-	
+
 	parser.add_argument('-l2',			type=float,	default=0,		help='L2 Regularization for Optimizer')
 	parser.add_argument('-lr',			type=float,	default=0.001,	help='Starting Learning Rate')
 	parser.add_argument('-lbl_smooth',	type=float,	default=0.1,	help='Label Smoothing')
@@ -383,15 +382,15 @@ if __name__ == '__main__':
 	parser.add_argument('-reason_type', dest='reason_type',	default='mixdrop',		help='Relation Reason Operation to be used in HoGRN')
 	parser.add_argument('-act_type', 	dest='act_type',	default='tanh',			help='Activation funtion to be used in HoGRN')
 	parser.add_argument('-rel_norm', 	dest='rel_norm',	action='store_true',	help='Whether to optimize the relation representation by normalization')
-	
+
 	parser.add_argument('-init_dim',	dest='init_dim',	default=100,	type=int,	help='Initial dimension size for entities and relations')
-	parser.add_argument('-gcn_dim',	  	dest='gcn_dim', 	default=100,   	type=int, 	help='Number of hidden units in GCN') 
+	parser.add_argument('-gcn_dim',	  	dest='gcn_dim', 	default=100,   	type=int, 	help='Number of hidden units in GCN')
 	parser.add_argument('-embed_dim',	dest='embed_dim', 	default=100,   	type=int, 	help='Embedding dimension to give as input to score function')
 	parser.add_argument('-gcn_layer',	dest='gcn_layer', 	default=1,   	type=int, 	help='Number of GCN Layers to use')
-	parser.add_argument('-gcn_drop',	dest='dropout', 	default=0,  	type=float,	help='Dropout to use in GCN Layer') 
+	parser.add_argument('-gcn_drop',	dest='dropout', 	default=0,  	type=float,	help='Dropout to use in GCN Layer')
 	parser.add_argument('-hid_drop',  	dest='hid_drop', 	default=0,  	type=float,	help='Dropout after GCN')
 	parser.add_argument('-relmix_dim',	dest='relmix_dim',	default=200,	type=int,	help='Number of hidden units in inter-relation learning')
-	parser.add_argument('-chamix_dim',	dest='chamix_dim', 	default=200,  	type=int, 	help='Number of hidden units in intra-relation learning') 
+	parser.add_argument('-chamix_dim',	dest='chamix_dim', 	default=200,  	type=int, 	help='Number of hidden units in intra-relation learning')
 	parser.add_argument('-rel_mask',  	dest='rel_mask', 	default=0,  	type=float,	help='Dropout in inter-relation learning')
 	parser.add_argument('-chan_drop',  	dest='chan_drop', 	default=0,  	type=float,	help='Dropout in intra-relation learning')
 	parser.add_argument('-edge_drop',  	dest='edge_drop', 	default=0,  	type=float,	help='Dropout in edge')
@@ -401,12 +400,13 @@ if __name__ == '__main__':
 	parser.add_argument('-sim_decay',	dest='sim_decay',	default=0,		type=float, help='Regularization weight for independence modeling')
 	parser.add_argument('-rel_drop',  	dest='rel_drop', 	default=0,  	type=float,	help='Dropout for generate positive relation')
 
-	# Information Bottleneck parameters
-	parser.add_argument('-use_ib',      dest='use_ib',      action='store_true',    help='Enable Information Bottleneck')
-	parser.add_argument('-ib_beta',     dest='ib_beta',     default=0.01,   type=float, help='Weight for KL divergence loss')
-	parser.add_argument('-polar_weight', dest='polar_weight', default=0.1, type=float, help='Weight for polarization loss')
-	parser.add_argument('-edge_selector_hidden', dest='edge_selector_hidden', default=100, type=int, help='Hidden dim for edge selector')
-	parser.add_argument('-ib_warmup_epochs', dest='ib_warmup_epochs', default=20, type=int, help='Warmup epochs for IB loss')
+	# Causal Structure Learning parameters
+	parser.add_argument('-use_causal',      dest='use_causal',      action='store_true',    help='Enable Causal Structure Learning')
+	parser.add_argument('-causal_alpha',    dest='causal_alpha',    default=0.1,   type=float, help='Weight for causal alignment loss')
+	parser.add_argument('-causal_beta',     dest='causal_beta',     default=0.1,   type=float, help='Weight for intervention consistency loss')
+	parser.add_argument('-causal_gamma',    dest='causal_gamma',    default=0.01,  type=float, help='Weight for causal separation loss')
+	parser.add_argument('-causal_hidden',   dest='causal_hidden',   default=100,   type=int,   help='Hidden dim for causal discovery')
+	parser.add_argument('-causal_warmup',   dest='causal_warmup',   default=10,    type=int,   help='Warmup epochs for causal loss')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')
@@ -460,7 +460,6 @@ if __name__ == '__main__':
 
 	if not args.restore: args.name = args.name + '_' + time.strftime('%d_%m_%Y') + '_' + time.strftime('%H-%M-%S')
 
-	# set_gpu(args.gpu)
 	np.random.seed(args.seed)
 	torch.manual_seed(args.seed)
 	if torch.cuda.is_available():
@@ -468,7 +467,6 @@ if __name__ == '__main__':
 		torch.cuda.manual_seed_all(args.seed)
 		torch.backends.cudnn.benchmark = False
 		torch.backends.cudnn.deterministic = True
-	# torch.autograd.set_detect_anomaly(True)
-	
+
 	model = Runner(args)
 	model.fit()

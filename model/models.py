@@ -1,7 +1,8 @@
 from helper import *
 from model.hogrn_conv import HoGRNConv
-from model.edge_selector import EdgeSelector
-from model.ib_loss import IBLoss, StochasticEncoder
+from model.causal_discovery import CausalDiscovery
+from model.intervention import SoftIntervention
+from model.causal_loss import CausalLoss
 
 
 class BaseModel(torch.nn.Module):
@@ -25,6 +26,7 @@ class HoGRNBase(BaseModel):
 		self.p.gcn_dim		= self.p.embed_dim if self.p.gcn_layer == 1 else self.p.gcn_dim
 		self.init_embed		= get_param((self.p.num_ent,   self.p.init_dim))
 		self.device			= self.edge_index.device
+		self.num_rel		= num_rel
 
 		if self.p.score_func == 'transe': 	self.init_rel = get_param((num_rel,   self.p.init_dim))
 		else: 								self.init_rel = get_param((num_rel*2, self.p.init_dim))
@@ -39,37 +41,58 @@ class HoGRNBase(BaseModel):
 
 		self.register_parameter('bias', Parameter(torch.zeros(self.p.num_ent)))
 
-		# ========== 信息瓶颈模块 ==========
-		self.use_ib = getattr(self.p, 'use_ib', False)
-		if self.use_ib:
-			# 边选择器
-			edge_hidden = getattr(self.p, 'edge_selector_hidden', self.p.init_dim)
-			self.edge_selector = EdgeSelector(self.p.init_dim, edge_hidden)
+		# ========== 因果结构学习模块 ==========
+		self.use_causal = getattr(self.p, 'use_causal', False)
+		if self.use_causal:
+			# 因果发现模块
+			causal_hidden = getattr(self.p, 'causal_hidden', self.p.init_dim)
+			self.causal_discovery = CausalDiscovery(
+				dim=self.p.init_dim,
+				hidden_dim=causal_hidden,
+				num_rels=num_rel
+			)
 
-			# 随机编码器（用于 KL 损失）
-			self.stochastic_encoder = StochasticEncoder(self.p.embed_dim, self.p.embed_dim)
+			# 软干预模块
+			self.soft_intervention = SoftIntervention()
 
-			# IB 损失
-			ib_beta = getattr(self.p, 'ib_beta', 0.01)
-			polar_weight = getattr(self.p, 'polar_weight', 0.1)
-			warmup_epochs = getattr(self.p, 'ib_warmup_epochs', 20)
-			self.ib_loss = IBLoss(beta=ib_beta, polar_weight=polar_weight, warmup_epochs=warmup_epochs)
+			# 因果损失
+			causal_alpha = getattr(self.p, 'causal_alpha', 0.1)
+			causal_beta = getattr(self.p, 'causal_beta', 0.1)
+			causal_gamma = getattr(self.p, 'causal_gamma', 0.01)
+			warmup_epochs = getattr(self.p, 'causal_warmup', 10)
+			self.causal_loss = CausalLoss(
+				alpha=causal_alpha,
+				beta=causal_beta,
+				gamma=causal_gamma,
+				warmup_epochs=warmup_epochs
+			)
 
-	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
-		n_edges = edge_index.shape[1]
-		random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
-		return edge_index[:, random_indices], edge_type[random_indices]
+			# 预计算节点度数
+			self._precompute_degrees()
 
-	def _compute_edge_weight(self, edge_index, edge_type):
+	def _precompute_degrees(self):
+		"""预计算节点度数"""
+		num_edges = self.edge_index.size(1)
+		src = self.edge_index[0]
+		dst = self.edge_index[1]
+
+		# 计算出度和入度
+		self.src_degrees = torch.zeros(self.p.num_ent, device=self.device)
+		self.dst_degrees = torch.zeros(self.p.num_ent, device=self.device)
+
+		self.src_degrees.scatter_add_(0, src, torch.ones(num_edges, device=self.device))
+		self.dst_degrees.scatter_add_(0, dst, torch.ones(num_edges, device=self.device))
+
+	def _compute_causal_scores(self, edge_index, edge_type):
 		"""
-		计算边权重（信息瓶颈软过滤）
+		计算边的因果分数
 
 		Args:
 			edge_index: 边索引 [2, num_edges]
 			edge_type: 边类型 [num_edges]
 
 		Returns:
-			edge_prob: 边重要性概率 [num_edges, 1]
+			causal_scores: 因果分数 [num_edges, 1]
 		"""
 		src, dst = edge_index
 		h_src = self.init_embed[src]  # [num_edges, dim]
@@ -79,10 +102,24 @@ class HoGRNBase(BaseModel):
 		r = self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
 		r_edge = r[edge_type]  # [num_edges, dim]
 
-		# 计算边重要性
-		edge_prob = self.edge_selector(h_src, h_dst, r_edge)
+		# 获取度数特征
+		src_deg = self.src_degrees[src]
+		dst_deg = self.dst_degrees[dst]
 
-		return edge_prob
+		# 计算因果分数
+		causal_scores = self.causal_discovery(
+			h_src, h_dst, r_edge,
+			edge_type=edge_type,
+			src_deg=src_deg,
+			dst_deg=dst_deg
+		)
+
+		return causal_scores
+
+	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
+		n_edges = edge_index.shape[1]
+		random_indices = np.random.choice(n_edges, size=int(n_edges * rate), replace=False)
+		return edge_index[:, random_indices], edge_type[random_indices]
 
 	def _cul_cor(self, rel):
 		if self.p.rel_drop > 0:
@@ -107,18 +144,21 @@ class HoGRNBase(BaseModel):
 
 		return mi_score
 
-	def forward_base(self, sub, rel, drop1, drop2):
+	def forward_base(self, sub, rel, drop1, drop2, edge_weight=None):
+		"""
+		基础前向传播
+
+		Args:
+			sub: 主语实体索引
+			rel: 关系索引
+			drop1: 第一层 dropout
+			drop2: 后续层 dropout
+			edge_weight: 边权重（因果加权），可选
+		"""
 		if self.p.edge_drop > 0:
 			edge_index, edge_type = self._edge_sampling(self.edge_index, self.edge_type, self.p.edge_drop)
 		else:
 			edge_index, edge_type = self.edge_index, self.edge_type
-
-		# ========== 计算边权重（如果启用 IB）==========
-		edge_weight = None
-		edge_prob = None
-		if self.use_ib:
-			edge_prob = self._compute_edge_weight(edge_index, edge_type)
-			edge_weight = edge_prob  # 直接用概率作为权重
 
 		r	= self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
 
@@ -126,18 +166,13 @@ class HoGRNBase(BaseModel):
 		x, r	= self.conv1(self.init_embed, edge_index, edge_type, rel_embed=r, edge_weight=edge_weight)
 		x	= drop1(x)
 
-		# 后续层（同样带边权重）
+		# 后续层
 		x, r	= self.conv2(x, edge_index, edge_type, rel_embed=r, edge_weight=edge_weight) if self.p.gcn_layer >= 2 else (x, r)
 		x	= drop2(x) if self.p.gcn_layer >= 2 else x
 		x, r	= self.conv3(x, edge_index, edge_type, rel_embed=r, edge_weight=edge_weight) if self.p.gcn_layer >= 3 else (x, r)
 		x	= drop2(x) if self.p.gcn_layer >= 3 else x
 		x, r	= self.conv4(x, edge_index, edge_type, rel_embed=r, edge_weight=edge_weight) if self.p.gcn_layer >= 4 else (x, r)
 		x	= drop2(x) if self.p.gcn_layer >= 4 else x
-
-		# ========== 随机编码（如果启用 IB）==========
-		mu, logvar = None, None
-		if self.use_ib:
-			x, mu, logvar = self.stochastic_encoder(x, training=self.training)
 
 		sub_emb	= torch.index_select(x, 0, sub)
 		rel_emb	= torch.index_select(r, 0, rel)
@@ -147,34 +182,34 @@ class HoGRNBase(BaseModel):
 		else:
 			cor = 0.
 
-		# 返回额外的 IB 信息
-		ib_info = {
-			'mu': mu,
-			'logvar': logvar,
-			'edge_prob': edge_prob
-		}
+		return sub_emb, rel_emb, x, cor
 
-		return sub_emb, rel_emb, x, cor, ib_info
-
-	def compute_ib_loss(self, ib_info):
+	def compute_causal_loss(self, causal_info, original_pred, counterfactual_pred):
 		"""
-		计算信息瓶颈损失
+		计算因果损失
 
 		Args:
-			ib_info: forward_base 返回的 IB 信息
+			causal_info: 因果信息字典
+			original_pred: 原始预测
+			counterfactual_pred: 反事实预测
 
 		Returns:
-			ib_loss: 标量损失
+			causal_loss: 因果损失
 			loss_dict: 损失详情
 		"""
-		if not self.use_ib or ib_info['mu'] is None:
-			return 0., {}
+		if not self.use_causal or causal_info['causal_scores'] is None:
+			return torch.tensor(0.0, device=self.device), {}
 
-		return self.ib_loss(
-			ib_info['mu'],
-			ib_info['logvar'],
-			ib_info['edge_prob']
-		)
+		causal_scores = causal_info['causal_scores']
+
+		# 构造干预数据（使用反事实作为干预结果）
+		interventions_data = [{
+			'intervened_pred': counterfactual_pred,
+			'intervened_indices': torch.arange(causal_scores.size(0), device=self.device),
+			'strategy': 'counterfactual'
+		}]
+
+		return self.causal_loss(causal_scores, original_pred, interventions_data)
 
 
 class HoGRN_TransE(HoGRNBase):
@@ -183,13 +218,36 @@ class HoGRN_TransE(HoGRNBase):
 		self.drop = torch.nn.Dropout(self.p.hid_drop)
 
 	def forward(self, sub, rel):
-		sub_emb, rel_emb, all_ent, cor, ib_info = self.forward_base(sub, rel, self.drop, self.drop)
-		obj_emb	= sub_emb + rel_emb
+		# 计算因果分数（如果启用）
+		causal_scores = None
+		edge_weight = None
+		cf_weight = None
 
+		if self.use_causal:
+			causal_scores = self._compute_causal_scores(self.edge_index, self.edge_type)
+			edge_weight = self.soft_intervention(causal_scores)
+			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
+
+		# 原始预测（使用因果权重）
+		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
+		obj_emb	= sub_emb + rel_emb
 		x		= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)
 		score	= torch.sigmoid(x)
 
-		return score, cor, ib_info
+		# 反事实预测（如果启用因果学习）
+		cf_score = None
+		if self.use_causal and self.training:
+			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=cf_weight)
+			obj_emb_cf = sub_emb_cf + rel_emb_cf
+			x_cf = self.p.gamma - torch.norm(obj_emb_cf.unsqueeze(1) - all_ent_cf, p=1, dim=2)
+			cf_score = torch.sigmoid(x_cf)
+
+		causal_info = {
+			'causal_scores': causal_scores,
+			'cf_score': cf_score
+		}
+
+		return score, cor, causal_info
 
 
 class HoGRN_DistMult(HoGRNBase):
@@ -198,14 +256,38 @@ class HoGRN_DistMult(HoGRNBase):
 		self.drop = torch.nn.Dropout(self.p.hid_drop)
 
 	def forward(self, sub, rel):
-		sub_emb, rel_emb, all_ent, cor, ib_info = self.forward_base(sub, rel, self.drop, self.drop)
-		obj_emb	= sub_emb * rel_emb
+		# 计算因果分数（如果启用）
+		causal_scores = None
+		edge_weight = None
+		cf_weight = None
 
+		if self.use_causal:
+			causal_scores = self._compute_causal_scores(self.edge_index, self.edge_type)
+			edge_weight = self.soft_intervention(causal_scores)
+			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
+
+		# 原始预测
+		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
+		obj_emb	= sub_emb * rel_emb
 		x 	= torch.mm(obj_emb, all_ent.transpose(1, 0))
 		x 	+= self.bias.expand_as(x)
-
 		score = torch.sigmoid(x)
-		return score, cor, ib_info
+
+		# 反事实预测
+		cf_score = None
+		if self.use_causal and self.training:
+			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=cf_weight)
+			obj_emb_cf = sub_emb_cf * rel_emb_cf
+			x_cf = torch.mm(obj_emb_cf, all_ent_cf.transpose(1, 0))
+			x_cf += self.bias.expand_as(x_cf)
+			cf_score = torch.sigmoid(x_cf)
+
+		causal_info = {
+			'causal_scores': causal_scores,
+			'cf_score': cf_score
+		}
+
+		return score, cor, causal_info
 
 
 class HoGRN_ConvE(HoGRNBase):
@@ -233,8 +315,8 @@ class HoGRN_ConvE(HoGRNBase):
 		stack_inp	= torch.transpose(stack_inp, 2, 1).reshape((-1, 1, 2*self.p.k_w, self.p.k_h))
 		return stack_inp
 
-	def forward(self, sub, rel):
-		sub_emb, rel_emb, all_ent, cor, ib_info = self.forward_base(sub, rel, self.hidden_drop, self.hidden_drop)
+	def _score_func(self, sub_emb, rel_emb, all_ent):
+		"""ConvE 评分函数"""
 		stk_inp	= self.concat(sub_emb, rel_emb)
 		x		= self.bn0(stk_inp)
 		x		= self.m_conv1(x)
@@ -251,4 +333,32 @@ class HoGRN_ConvE(HoGRNBase):
 		x 		+= self.bias.expand_as(x)
 
 		score	= torch.sigmoid(x)
-		return score, cor, ib_info
+		return score
+
+	def forward(self, sub, rel):
+		# 计算因果分数（如果启用）
+		causal_scores = None
+		edge_weight = None
+		cf_weight = None
+
+		if self.use_causal:
+			causal_scores = self._compute_causal_scores(self.edge_index, self.edge_type)
+			edge_weight = self.soft_intervention(causal_scores)
+			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
+
+		# 原始预测
+		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.hidden_drop, self.hidden_drop, edge_weight=edge_weight)
+		score = self._score_func(sub_emb, rel_emb, all_ent)
+
+		# 反事实预测
+		cf_score = None
+		if self.use_causal and self.training:
+			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.hidden_drop, self.hidden_drop, edge_weight=cf_weight)
+			cf_score = self._score_func(sub_emb_cf, rel_emb_cf, all_ent_cf)
+
+		causal_info = {
+			'causal_scores': causal_scores,
+			'cf_score': cf_score
+		}
+
+		return score, cor, causal_info

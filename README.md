@@ -44,3 +44,6 @@ python analyze_glomem.py --checkpoint checkpoints/testrun_19_01_2026_18-18-40 --
 
 
 python run.py -config_file exp_configs/nell23k_conve_ib.json
+
+
+python run.py -config_file exp_configs/nell23k_conve_causal.json
