@@ -13,8 +13,5 @@
   "chan_drop": 0.1,
   "rel_mask": 0.1,
   "rel_norm": true,
-  "hid_drop": 0.3,
-
-  "_comment": "Reverse Path Reasoning",
-  "use_reverse_path": true
+  "hid_drop": 0.3
 }

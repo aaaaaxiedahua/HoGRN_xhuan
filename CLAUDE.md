@@ -34,48 +34,50 @@ python analyze_glomem.py --checkpoint checkpoints/<run_name> --dataset NELL23K -
 
 ### Core Components
 
-- **`run.py`**: Main entry point. Handles data loading (`load_data()`), adjacency construction (`construct_adj()`), training loop (`fit()`), and evaluation (`evaluate()`).
-- **`model/models.py`**: Model definitions (HoGRN_TransE, HoGRN_DistMult, HoGRN_ConvE) inheriting from HoGRNBase with GCN layers and optional enhancement modules.
-- **`model/hogrn_conv.py`**: HoGRNConv - relation-aware message-passing layer with mult/sub/corr operations.
-- **`model/mixer.py`**: MixerDrop blocks for inter-relation (relation masking) and intra-relation (channel dropout) learning.
-- **`model/rpg_module.py`**: RPG-HoGRN modules - PathGuidedAggregator and AdaptiveFusion for sparse node enhancement.
-- **`model/path_mining.py`**: PathMiner for discovering frequent 2-3 hop relation paths.
-- **`data_loader.py`**: TrainDataset (label smoothing, negative sampling) and TestDataset (full entity evaluation).
+- **`run.py`**: Main entry point. Contains `Runner` class with data loading (`load_data()`), adjacency construction (`construct_adj()`), training loop (`fit()`), and evaluation (`evaluate()`).
+- **`model/models.py`**: Model definitions (HoGRN_TransE, HoGRN_DistMult, HoGRN_ConvE) inheriting from `HoGRNBase`. Each model combines GCN message passing with a specific scoring function.
+- **`model/hogrn_conv.py`**: `HoGRNConv` - relation-aware message-passing layer with mult/sub/corr composition operations and optional MixerDrop reasoning.
+- **`model/mixer.py`**: `MixerDrop` blocks implementing inter-relation learning (relation masking) and intra-relation learning (channel dropout via MLP).
+- **`model/rpg_module.py`**: `PrototypeEnhancer` - computes relation-specific answer prototypes and enhances scores via similarity.
+- **`model/path_mining.py`**: `PathMiner` - standalone utility for discovering frequent 2-3 hop relation paths (not integrated into main training).
+- **`data_loader.py`**: `TrainDataset` (label smoothing, 1-N training) and `TestDataset` (full entity ranking evaluation).
 
 ### Data Flow
 
 1. Load triplets from `data/<dataset>/` (train.txt, valid.txt, test.txt)
-2. Build entity/relation mappings and inverse relations
-3. Construct adjacency via `construct_adj()`
-4. Optional: Mine relation paths if RPG enabled (`model/path_mining.py`)
-5. Forward: entities/relations through GCN layers with optional RPG enhancement
-6. Score predictions using TransE/DistMult/ConvE
-7. Evaluate with MRR, MR, Hits@K metrics
+2. Build entity/relation mappings; create inverse relations (rel + num_rel)
+3. Construct edge_index/edge_type via `construct_adj()`
+4. Forward: entities/relations through HoGRNConv layers with optional MixerDrop reasoning
+5. Score predictions using TransE/DistMult/ConvE
+6. Evaluate with MRR, MR, Hits@1-10 metrics
 
 ### Configuration System
 
-JSON configs in `exp_configs/` support all command-line arguments. Keys map to argument names (e.g., `batch` -> `batch_size`). Keys starting with `_` are ignored (metadata/comments).
+JSON configs in `exp_configs/` support all command-line arguments. Key mappings:
+- `batch` → `batch_size`
+- `data` → `dataset`
+- `epoch` → `max_epochs`
+- `gcn_drop` → `dropout`
+
+Keys starting with `_` are ignored (used for comments/metadata).
 
 ## Model Architecture
 
-### Base HoGRN
-Weight-free GCN message passing with relation reasoning module (Inter/Intra-relation learning):
-- **HoGRNConv**: Relation-aware graph convolution with mult/sub/corr composition operations
-- **MixerDrop**: Inter-relation learning (relation-wise dropout) + Intra-relation learning (channel-wise processing)
-- **Scoring Functions**: TransE (translation), DistMult (bilinear), ConvE (2D convolution)
+### HoGRNConv Layer
+Relation-aware message passing without learnable weight matrices:
+- **Composition operations**: `mult` (element-wise multiply), `sub` (subtraction), `corr` (circular correlation)
+- **Message aggregation**: Bidirectional (in + out + loop) with tanh attention coefficients
+- **Optional relation reasoning**: MixerDrop applied before or after aggregation (`-pre_reason` flag)
 
-### RPG-HoGRN (Relation Path Guided Enhancement)
-Addresses sparse (low-degree) nodes by propagating features along frequent relation paths:
-- **PathMiner**: Discovers frequent 2-3 hop relation paths during preprocessing, saves to `data/{dataset}/paths/frequent_paths.pkl`
-- **PathGuidedAggregator**: Builds sparse adjacency matrices per relation, computes path composition via sparse matrix multiplication
-- **AdaptiveFusion**: Gate network fuses local (GCN) and remote (path-guided) features based on node sparsity (1/(degree+1))
+### MixerDrop Block
+Two-stage relation representation learning:
+1. **Inter-relation learning**: Transpose relations → MLP across relation dimension → transpose back. Uses relation masking dropout during training.
+2. **Intra-relation learning**: MLP across embedding dimension with channel dropout.
 
-**RPG Parameters:**
-- `-use_rpg`: Enable RPG enhancement
-- `-rpg_max_path_length`: Max path length (2-3)
-- `-rpg_min_path_count`: Min path frequency threshold
-- `-rpg_top_k_paths`: Top-k paths per relation
-- `-rpg_sparse_threshold`: Degree threshold for sparse nodes
+### Scoring Functions
+- **TransE**: `γ - ||h + r - t||₁` (translation-based)
+- **DistMult**: `(h * r) · t + bias` (bilinear)
+- **ConvE**: 2D convolution on reshaped (h, r) concatenation → FC → dot product with all entities
 
 ## Key Parameters
 
@@ -83,12 +85,16 @@ Addresses sparse (low-degree) nodes by propagating features along frequent relat
 |-----------|-------------|
 | `-data` | Dataset: FB15K-237-10/20/50, WN18RR, NELL23K, WD-singer |
 | `-score_func` | Scoring: transe, distmult, conve |
-| `-rel_reason` | Enable relation reasoning (MixerDrop) |
-| `-pre_reason` | Apply reasoning before aggregation |
-| `-use_rpg` | Enable RPG-HoGRN path guidance |
+| `-opn` | Composition operation: mult, sub, corr |
+| `-rel_reason` | Enable MixerDrop relation reasoning |
+| `-pre_reason` | Apply reasoning before (vs after) aggregation |
 | `-gcn_layer` | Number of GCN layers (1-4) |
-| `-gcn_drop`, `-hid_drop`, `-chan_drop` | Dropout rates |
+| `-gcn_drop` | Dropout in GCN layer |
+| `-hid_drop` | Dropout after GCN |
+| `-rel_mask` | Relation masking rate in MixerDrop |
+| `-chan_drop` | Channel dropout rate in MixerDrop |
 | `-gamma` | Margin for TransE scoring |
+| `-sim_decay` | Weight for relational contrastive loss (0 to disable) |
 
 ## Data Format
 

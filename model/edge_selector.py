@@ -1,0 +1,120 @@
+"""
+边选择器模块 (Edge Selector)
+
+核心思想：
+- 为每条边计算重要性概率 prob ∈ [0, 1]
+- prob 直接作为消息传递的权重
+- 通过分化损失让 prob 趋向 0 或 1，实现软过滤
+"""
+
+import torch
+import torch.nn as nn
+
+
+class EdgeSelector(nn.Module):
+    """
+    边重要性评估器
+
+    输入: 头实体嵌入、关系嵌入、尾实体嵌入
+    输出: 边重要性概率 (用作消息传递的权重)
+    """
+
+    def __init__(self, dim, hidden_dim=None):
+        """
+        Args:
+            dim: 输入嵌入维度
+            hidden_dim: 隐藏层维度，默认等于 dim
+        """
+        super().__init__()
+        hidden_dim = hidden_dim or dim
+
+        # 边重要性评分网络
+        # 输入: [h_src || r_edge || h_dst]，维度为 3*dim
+        self.scorer = nn.Sequential(
+            nn.Linear(dim * 3, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+        # 初始化：让初始输出接近 0.5
+        self._init_weights()
+
+    def _init_weights(self):
+        """初始化权重，使初始 prob 接近 0.5"""
+        for m in self.scorer:
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, h_src, h_dst, r_emb):
+        """
+        计算边重要性概率
+
+        Args:
+            h_src: 源节点(头实体)嵌入 [num_edges, dim]
+            h_dst: 目标节点(尾实体)嵌入 [num_edges, dim]
+            r_emb: 边(关系)嵌入 [num_edges, dim]
+
+        Returns:
+            prob: 边重要性概率 [num_edges, 1]
+        """
+        # 拼接边特征
+        edge_feat = torch.cat([h_src, r_emb, h_dst], dim=-1)
+
+        # 计算重要性分数
+        logits = self.scorer(edge_feat)
+
+        # Sigmoid 映射到 [0, 1]
+        prob = torch.sigmoid(logits)
+
+        return prob
+
+    def polarization_loss(self, prob):
+        """
+        分化损失：鼓励 prob 趋向 0 或 1
+
+        原理: 最小化熵 → 分布变得确定 → prob 趋向极端值
+
+        L = -mean(prob * log(prob) + (1-prob) * log(1-prob))
+
+        当 prob=0.5 时，熵最大，损失最大
+        当 prob=0 或 1 时，熵为 0，损失为 0
+
+        Args:
+            prob: 边重要性概率 [num_edges, 1]
+
+        Returns:
+            loss: 标量损失值
+        """
+        eps = 1e-8
+        # 负熵
+        entropy = -(prob * torch.log(prob + eps) +
+                    (1 - prob) * torch.log(1 - prob + eps))
+        return entropy.mean()
+
+    def get_stats(self, prob):
+        """
+        获取边选择的统计信息（用于日志记录）
+
+        Args:
+            prob: 边重要性概率
+
+        Returns:
+            dict: 统计信息
+        """
+        with torch.no_grad():
+            prob_flat = prob.squeeze()
+            stats = {
+                'prob_mean': prob_flat.mean().item(),
+                'prob_std': prob_flat.std().item(),
+                'prob_min': prob_flat.min().item(),
+                'prob_max': prob_flat.max().item(),
+                'high_prob_ratio': (prob_flat > 0.5).float().mean().item(),  # prob>0.5 的比例
+                'very_high_ratio': (prob_flat > 0.9).float().mean().item(),  # prob>0.9 的比例
+                'very_low_ratio': (prob_flat < 0.1).float().mean().item(),   # prob<0.1 的比例
+            }
+        return stats

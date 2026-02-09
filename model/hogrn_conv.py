@@ -38,7 +38,21 @@ class HoGRNConv(MessagePassing):
 				self.MixerBlock_2 = MixerDrop(self.num_rels*2+1, out_channels, self.p.relmix_dim, self.p.chamix_dim, self.p.rel_mask, self.p.chan_drop)
 				self.MixerBlock_3 = MixerDrop(self.num_rels*2+1, out_channels, self.p.relmix_dim, self.p.chamix_dim, self.p.rel_mask, self.p.chan_drop)
 
-	def forward(self, x, edge_index, edge_type, rel_embed): 
+	def forward(self, x, edge_index, edge_type, rel_embed, edge_weight=None):
+		"""
+		前向传播
+
+		Args:
+			x: 节点特征 [num_nodes, in_channels]
+			edge_index: 边索引 [2, num_edges*2] (包含正向和反向边)
+			edge_type: 边类型 [num_edges*2]
+			rel_embed: 关系嵌入 [num_rels*2, in_channels]
+			edge_weight: 边权重 [num_edges*2, 1]，可选，用于信息瓶颈的软过滤
+
+		Returns:
+			out: 更新后的节点特征 [num_nodes, out_channels]
+			rel_embed: 更新后的关系嵌入 [num_rels*2, out_channels]
+		"""
 		if self.device is None:
 			self.device = edge_index.device
 
@@ -49,6 +63,14 @@ class HoGRNConv(MessagePassing):
 
 		self.in_index, self.out_index = edge_index[:, :num_edges], edge_index[:, num_edges:]
 		self.in_type,  self.out_type  = edge_type[:num_edges], 	 edge_type [num_edges:]
+
+		# 分割边权重（如果提供）
+		if edge_weight is not None:
+			self.in_weight = edge_weight[:num_edges]
+			self.out_weight = edge_weight[num_edges:]
+		else:
+			self.in_weight = None
+			self.out_weight = None
 
 		self.loop_index  = torch.stack([torch.arange(num_ent), torch.arange(num_ent)]).to(self.device)
 		self.loop_type   = torch.full((num_ent,), rel_embed.size(0)-1, dtype=torch.long).to(self.device)
@@ -62,13 +84,13 @@ class HoGRNConv(MessagePassing):
 				rel_embed = self.rel_norm(rel_embed)
 
 		if self.p.act_type == 'tanh':
-			in_res		= self.propagate('add', self.in_index,   x=x, edge_type=self.in_type,   rel_embed=rel_embed, edge_norm=self.in_norm)
-			loop_res	= self.propagate('add', self.loop_index, x=x, edge_type=self.loop_type, rel_embed=rel_embed, edge_norm=None)
-			out_res		= self.propagate('add', self.out_index,  x=x, edge_type=self.out_type,  rel_embed=rel_embed, edge_norm=self.out_norm)
+			in_res		= self.propagate('add', self.in_index,   x=x, edge_type=self.in_type,   rel_embed=rel_embed, edge_norm=self.in_norm,  edge_weight=self.in_weight)
+			loop_res	= self.propagate('add', self.loop_index, x=x, edge_type=self.loop_type, rel_embed=rel_embed, edge_norm=None, edge_weight=None)
+			out_res		= self.propagate('add', self.out_index,  x=x, edge_type=self.out_type,  rel_embed=rel_embed, edge_norm=self.out_norm, edge_weight=self.out_weight)
 			out			= self.drop(in_res)*(1/3) + self.drop(out_res)*(1/3) + loop_res*(1/3)
 		elif self.p.act_type == 'softmax':
-			in_res		= self.propagate('add', self.in_index,   x=x, edge_type=self.in_type,   rel_embed=rel_embed, edge_norm=None)
-			out_res		= self.propagate('add', self.out_index,  x=x, edge_type=self.out_type,  rel_embed=rel_embed, edge_norm=None)
+			in_res		= self.propagate('add', self.in_index,   x=x, edge_type=self.in_type,   rel_embed=rel_embed, edge_norm=None, edge_weight=self.in_weight)
+			out_res		= self.propagate('add', self.out_index,  x=x, edge_type=self.out_type,  rel_embed=rel_embed, edge_norm=None, edge_weight=self.out_weight)
 			out			= self.drop(in_res)*(1/2) + self.drop(out_res)*(1/2) 
 
 		if self.p.bias: out = out + self.bias
@@ -103,17 +125,37 @@ class HoGRNConv(MessagePassing):
 			rel_embed = self.MixerBlock_2(rel_embed, training=self.training)
 			return self.MixerBlock_3(rel_embed, training=self.training)
 
-	def message(self, x_i, x_j, edge_type, rel_embed, edge_norm):
+	def message(self, x_i, x_j, edge_type, rel_embed, edge_norm, edge_weight=None):
+		"""
+		计算边消息
+
+		Args:
+			x_i: 目标节点特征
+			x_j: 源节点特征
+			edge_type: 边类型
+			rel_embed: 关系嵌入
+			edge_norm: 归一化系数
+			edge_weight: 边权重（信息瓶颈软过滤）
+		"""
 		rel_emb		= torch.index_select(rel_embed, 0, edge_type)
 		xi_rel		= self.rel_transform(x_i, rel_emb)
 		xj_rel  	= self.rel_transform(x_j, rel_emb)
 		if self.p.act_type == 'tanh':
 			aggr_coef	= self.act((xi_rel * xj_rel).sum(dim=-1, keepdim=True))
 		elif self.p.act_type == 'softmax':
-			alpha 		= (xi_rel * xj_rel).sum(dim=-1, keepdim=True) 
-			aggr_coef	= self.softmax_sp(alpha, self.in_index[0], self.num_ent) 
+			alpha 		= (xi_rel * xj_rel).sum(dim=-1, keepdim=True)
+			aggr_coef	= self.softmax_sp(alpha, self.in_index[0], self.num_ent)
 		out			= aggr_coef * xj_rel
-		return out if edge_norm is None else out * edge_norm.view(-1, 1)
+
+		# 应用边归一化
+		if edge_norm is not None:
+			out = out * edge_norm.view(-1, 1)
+
+		# 应用边权重（信息瓶颈软过滤）
+		if edge_weight is not None:
+			out = out * edge_weight
+
+		return out
 
 	def update(self, aggr_out):
 		return aggr_out

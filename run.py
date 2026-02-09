@@ -235,14 +235,14 @@ class Runner(object):
 
 			for step, batch in enumerate(train_iter):
 				sub, rel, obj, label	= self.read_batch(batch, split)
-				pred, _			= self.model.forward(sub, rel)
+				pred, _, _		= self.model.forward(sub, rel)  # 增加了 ib_info 返回值
 				b_range			= torch.arange(pred.size()[0], device=self.device)
 				target_pred		= pred[b_range, obj]
 				pred 			= torch.where(label.byte(), -torch.ones_like(pred) * 10000000, pred)
 				pred[b_range, obj] 	= target_pred
 				ranks			= 1 + torch.argsort(torch.argsort(pred, dim=1, descending=True), dim=1, descending=False)[b_range, obj]
 				ranks 			= ranks.float()
-				
+
 				results['count']	= torch.numel(ranks) 		+ results.get('count', 0.0)
 				results['mr']		= torch.sum(ranks).item() 	+ results.get('mr',    0.0)
 				results['mrr']		= torch.sum(1.0/ranks).item()   + results.get('mrr',   0.0)
@@ -260,17 +260,24 @@ class Runner(object):
 		"""
 		self.model.train()
 		losses = []
+		ib_losses = []
 		train_iter = iter(self.data_iter['train'])
 
 		for step, batch in enumerate(train_iter):
 			self.optimizer.zero_grad()
 			sub, rel, obj, label = self.read_batch(batch, 'train')
 
-			pred, cor	= self.model.forward(sub, rel)
-			loss	= self.model.loss(pred, label)
+			pred, cor, ib_info = self.model.forward(sub, rel)
+			loss = self.model.loss(pred, label)
 
 			if self.p.sim_decay > 0:
 				loss += self.p.sim_decay * cor
+
+			# 添加信息瓶颈损失
+			if getattr(self.p, 'use_ib', False):
+				ib_loss, ib_loss_dict = self.model.compute_ib_loss(ib_info)
+				loss += ib_loss
+				ib_losses.append(ib_loss_dict)
 
 			loss.backward()
 			self.optimizer.step()
@@ -280,7 +287,23 @@ class Runner(object):
 			# 	self.logger.info('[E:{}| {}]: Train Loss:{:.5}'.format(epoch, step, np.mean(losses)))
 
 		loss = np.mean(losses)
-		self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
+
+		# 记录 IB 损失信息
+		if getattr(self.p, 'use_ib', False) and len(ib_losses) > 0:
+			avg_kl = np.mean([d.get('kl_loss', 0) for d in ib_losses])
+			avg_polar = np.mean([d.get('polar_loss', 0) for d in ib_losses])
+			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}, KL:{:.4}, Polar:{:.4}\n'.format(
+				epoch, loss, avg_kl, avg_polar))
+
+			# 每 10 个 epoch 记录边选择统计信息
+			if epoch % 10 == 0 and ib_info['edge_prob'] is not None:
+				edge_stats = self.model.edge_selector.get_stats(ib_info['edge_prob'])
+				self.logger.info('[Epoch:{}]:  Edge Stats: mean={:.3f}, std={:.3f}, high_ratio={:.3f}, very_high={:.3f}, very_low={:.3f}'.format(
+					epoch, edge_stats['prob_mean'], edge_stats['prob_std'],
+					edge_stats['high_prob_ratio'], edge_stats['very_high_ratio'], edge_stats['very_low_ratio']))
+		else:
+			self.logger.info('[Epoch:{}]:  Training Loss:{:.4}\n'.format(epoch, loss))
+
 		return loss
 
 	def fit(self):
@@ -298,7 +321,6 @@ class Runner(object):
 		# for epoch in range(1):
 		for epoch in range(self.p.max_epochs):
 			print("########")
-			self.p._current_epoch = epoch
 			t0 = time.time()
 			train_loss  = self.run_epoch(epoch, val_mrr)
 			print("Time cost in one epoch for training: {:.4f}s".format((time.time()-t0)/60))
@@ -377,6 +399,12 @@ if __name__ == '__main__':
 	parser.add_argument('-sim_decay',	dest='sim_decay',	default=0,		type=float, help='Regularization weight for independence modeling')
 	parser.add_argument('-rel_drop',  	dest='rel_drop', 	default=0,  	type=float,	help='Dropout for generate positive relation')
 
+	# Information Bottleneck parameters
+	parser.add_argument('-use_ib',      dest='use_ib',      action='store_true',    help='Enable Information Bottleneck')
+	parser.add_argument('-ib_beta',     dest='ib_beta',     default=0.01,   type=float, help='Weight for KL divergence loss')
+	parser.add_argument('-polar_weight', dest='polar_weight', default=0.1, type=float, help='Weight for polarization loss')
+	parser.add_argument('-edge_selector_hidden', dest='edge_selector_hidden', default=100, type=int, help='Hidden dim for edge selector')
+
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')
 	parser.add_argument('-feat_drop', 	dest='feat_drop', 	default=0.3,  	type=float,	help='ConvE: Feature Dropout')
@@ -384,9 +412,6 @@ if __name__ == '__main__':
 	parser.add_argument('-k_h',	  		dest='k_h', 		default=10,   	type=int, 	help='ConvE: k_h')
 	parser.add_argument('-num_filt',  	dest='num_filt', 	default=32,   	type=int, 	help='ConvE: Number of filters in convolution')
 	parser.add_argument('-ker_sz',    	dest='ker_sz', 		default=3,   	type=int, 	help='ConvE: Kernel size to use')
-
-	# Reverse Path Reasoning
-	parser.add_argument('-use_reverse_path', dest='use_reverse_path', action='store_true', help='Whether to use reverse path reasoning enhancement')
 
 	parser.add_argument('-logdir',		dest='log_dir',		default='./log/',		help='Log directory')
 	parser.add_argument('-config',		dest='config_dir',	default='./config/',	help='Config directory')
