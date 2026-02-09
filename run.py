@@ -406,6 +406,7 @@ if __name__ == '__main__':
 	parser.add_argument('-ib_beta',     dest='ib_beta',     default=0.01,   type=float, help='Weight for KL divergence loss')
 	parser.add_argument('-polar_weight', dest='polar_weight', default=0.1, type=float, help='Weight for polarization loss')
 	parser.add_argument('-edge_selector_hidden', dest='edge_selector_hidden', default=100, type=int, help='Hidden dim for edge selector')
+	parser.add_argument('-ib_warmup_epochs', dest='ib_warmup_epochs', default=20, type=int, help='Warmup epochs for IB loss')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')

@@ -50,8 +50,8 @@ class EdgeSelector(nn.Module):
         """初始化权重，使初始 prob 接近 0.5"""
         for m in self.scorer:
             if isinstance(m, nn.Linear):
-                # 使用较小的初始化，让初始输出接近 0（sigmoid(0) = 0.5）
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
+                # 使用适中的初始化，让初始输出接近 0（sigmoid(0) = 0.5）
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
@@ -107,11 +107,9 @@ class EdgeSelector(nn.Module):
 
     def polarization_loss(self, prob):
         """
-        分化损失：鼓励 prob 趋向 0 或 1，同时保持稀疏性
+        分化损失：鼓励 prob 趋向 0 或 1
 
-        包含两部分：
-        1. 熵损失：让分布确定（趋向 0 或 1）
-        2. 稀疏损失：鼓励更多边被过滤（趋向 0）
+        只使用熵损失，让预测损失的梯度决定哪些边趋向 1（重要）、哪些趋向 0（不重要）
 
         Args:
             prob: 边重要性概率 [num_edges, 1]
@@ -121,18 +119,13 @@ class EdgeSelector(nn.Module):
         """
         eps = 1e-8
 
-        # 1. 熵损失：鼓励极端化
+        # 熵损失：鼓励极端化（趋向 0 或 1）
+        # 不加 sparse_loss，让预测损失的梯度决定方向
         entropy = -(prob * torch.log(prob + eps) +
                     (1 - prob) * torch.log(1 - prob + eps))
         entropy_loss = entropy.mean()
 
-        # 2. 稀疏损失：鼓励 prob 趋向 0（过滤更多边）
-        # 但不能太强，否则所有边都被过滤
-        sparse_loss = prob.mean()
-
-        # 组合：熵损失 + 0.5 * 稀疏损失
-        # 稀疏损失权重较小，只起到"打破对称"的作用
-        return entropy_loss + 0.5 * sparse_loss
+        return entropy_loss
 
     def get_stats(self, prob):
         """

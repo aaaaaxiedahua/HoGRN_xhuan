@@ -17,6 +17,7 @@
   "rel_norm": true,
   "use_ib": true,
   "ib_beta": 0.001,
-  "polar_weight": 0.01,
-  "edge_selector_hidden": 100
+  "polar_weight": 0.05,
+  "edge_selector_hidden": 100,
+  "ib_warmup_epochs": 30
 }

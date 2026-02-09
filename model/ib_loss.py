@@ -99,24 +99,20 @@ class IBLoss(nn.Module):
         # KL 散度损失
         kl_loss = self.kl_divergence(mu, logvar)
 
-        # 分化损失（包含稀疏项）
+        # 分化损失（纯熵损失，不含稀疏项）
         polar_loss = self.polarization_loss(edge_prob)
 
-        # 稀疏损失：鼓励更多边被过滤
-        sparse_loss = edge_prob.mean()
-
         # 总损失（乘以 warmup 系数）
+        # 不加 sparse_loss，让预测损失的梯度决定边的重要性
         total_loss = warmup * (
             self.beta * kl_loss +
-            self.polar_weight * polar_loss +
-            0.05 * sparse_loss  # 小权重的稀疏损失
+            self.polar_weight * polar_loss
         )
 
         loss_dict = {
             'ib_total': total_loss.item(),
             'kl_loss': kl_loss.item(),
             'polar_loss': polar_loss.item(),
-            'sparse_loss': sparse_loss.item(),
             'warmup': warmup,
             'beta': self.beta,
             'polar_weight': self.polar_weight

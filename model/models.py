@@ -52,7 +52,8 @@ class HoGRNBase(BaseModel):
 			# IB 损失
 			ib_beta = getattr(self.p, 'ib_beta', 0.01)
 			polar_weight = getattr(self.p, 'polar_weight', 0.1)
-			self.ib_loss = IBLoss(beta=ib_beta, polar_weight=polar_weight)
+			warmup_epochs = getattr(self.p, 'ib_warmup_epochs', 20)
+			self.ib_loss = IBLoss(beta=ib_beta, polar_weight=polar_weight, warmup_epochs=warmup_epochs)
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
