@@ -17,8 +17,8 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "use_causal": true,
-  "causal_sparse": 0.0001,
-  "causal_target": 0.5,
+  "causal_sparse": 0.001,
+  "causal_target": 0.3,
   "causal_base": 0.3,
   "causal_scale": 0.7,
   "causal_hidden": 100,
@@ -26,5 +26,5 @@
   "causal_temp_init": 1.0,
   "causal_temp_min": 0.1,
   "causal_temp_anneal": 0.005,
-  "causal_lr": 0.001
+  "causal_lr": 0.01
 }
