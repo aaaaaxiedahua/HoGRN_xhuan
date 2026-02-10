@@ -101,6 +101,7 @@ class HoGRNBase(BaseModel):
 
 		Returns:
 			causal_scores: 因果分数 [num_edges, 1]
+			causal_logits: 因果 logits [num_edges, 1]（sigmoid 之前）
 		"""
 		src, dst = edge_index
 		h_src = self.init_embed[src]  # [num_edges, dim]
@@ -114,15 +115,15 @@ class HoGRNBase(BaseModel):
 		src_deg = self.src_degrees[src]
 		dst_deg = self.dst_degrees[dst]
 
-		# 计算因果分数
-		causal_scores = self.causal_discovery(
+		# 计算因果分数（返回 scores 和 logits）
+		causal_scores, causal_logits = self.causal_discovery(
 			h_src, h_dst, r_edge,
 			edge_type=edge_type,
 			src_deg=src_deg,
 			dst_deg=dst_deg
 		)
 
-		return causal_scores
+		return causal_scores, causal_logits
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -197,7 +198,7 @@ class HoGRNBase(BaseModel):
 		计算因果损失（对比学习版）
 
 		Args:
-			causal_info: 因果信息字典，包含 causal_scores
+			causal_info: 因果信息字典，包含 causal_scores 和 causal_logits
 			original_loss: 原始预测的 BCE 损失（标量）
 			counterfactual_loss: 反事实预测的 BCE 损失（标量）
 
@@ -209,9 +210,12 @@ class HoGRNBase(BaseModel):
 			return torch.tensor(0.0, device=self.device), {}
 
 		causal_scores = causal_info['causal_scores']
+		causal_logits = causal_info.get('causal_logits')
 
-		# 使用新接口：直接传入损失值
-		causal_loss, loss_dict = self.causal_loss(causal_scores, original_loss, counterfactual_loss)
+		# 传入 logits 用于均衡损失（绕过 sigmoid 饱和区）
+		causal_loss, loss_dict = self.causal_loss(
+			causal_scores, original_loss, counterfactual_loss, logits=causal_logits
+		)
 
 		# 添加 edge_weight 统计
 		edge_weight = causal_info.get('edge_weight')
@@ -236,23 +240,21 @@ class HoGRN_TransE(HoGRNBase):
 		self.drop = torch.nn.Dropout(self.p.hid_drop)
 
 	def forward(self, sub, rel):
-		# 计算因果分数（如果启用）
 		causal_scores = None
+		causal_logits = None
 		edge_weight = None
 		cf_weight = None
 
 		if self.use_causal:
-			causal_scores = self._compute_causal_scores(self.edge_index, self.edge_type)
+			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
 			edge_weight = self.soft_intervention(causal_scores)
 			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
 
-		# 原始预测（使用因果权重）
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
 		obj_emb	= sub_emb + rel_emb
 		x		= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)
 		score	= torch.sigmoid(x)
 
-		# 反事实预测（如果启用因果学习）
 		cf_score = None
 		if self.use_causal and self.training:
 			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=cf_weight)
@@ -261,12 +263,9 @@ class HoGRN_TransE(HoGRNBase):
 			cf_score = torch.sigmoid(x_cf)
 
 		causal_info = {
-			'causal_scores': causal_scores,
-			'edge_weight': edge_weight,
-			'cf_weight': cf_weight,
-			'cf_score': cf_score
+			'causal_scores': causal_scores, 'causal_logits': causal_logits,
+			'edge_weight': edge_weight, 'cf_weight': cf_weight, 'cf_score': cf_score
 		}
-
 		return score, cor, causal_info
 
 
@@ -276,24 +275,22 @@ class HoGRN_DistMult(HoGRNBase):
 		self.drop = torch.nn.Dropout(self.p.hid_drop)
 
 	def forward(self, sub, rel):
-		# 计算因果分数（如果启用）
 		causal_scores = None
+		causal_logits = None
 		edge_weight = None
 		cf_weight = None
 
 		if self.use_causal:
-			causal_scores = self._compute_causal_scores(self.edge_index, self.edge_type)
+			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
 			edge_weight = self.soft_intervention(causal_scores)
 			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
 
-		# 原始预测
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
 		obj_emb	= sub_emb * rel_emb
 		x 	= torch.mm(obj_emb, all_ent.transpose(1, 0))
 		x 	+= self.bias.expand_as(x)
 		score = torch.sigmoid(x)
 
-		# 反事实预测
 		cf_score = None
 		if self.use_causal and self.training:
 			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=cf_weight)
@@ -303,12 +300,9 @@ class HoGRN_DistMult(HoGRNBase):
 			cf_score = torch.sigmoid(x_cf)
 
 		causal_info = {
-			'causal_scores': causal_scores,
-			'edge_weight': edge_weight,
-			'cf_weight': cf_weight,
-			'cf_score': cf_score
+			'causal_scores': causal_scores, 'causal_logits': causal_logits,
+			'edge_weight': edge_weight, 'cf_weight': cf_weight, 'cf_score': cf_score
 		}
-
 		return score, cor, causal_info
 
 
@@ -360,11 +354,12 @@ class HoGRN_ConvE(HoGRNBase):
 	def forward(self, sub, rel):
 		# 计算因果分数（如果启用）
 		causal_scores = None
+		causal_logits = None
 		edge_weight = None
 		cf_weight = None
 
 		if self.use_causal:
-			causal_scores = self._compute_causal_scores(self.edge_index, self.edge_type)
+			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
 			edge_weight = self.soft_intervention(causal_scores)
 			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
 
@@ -379,10 +374,7 @@ class HoGRN_ConvE(HoGRNBase):
 			cf_score = self._score_func(sub_emb_cf, rel_emb_cf, all_ent_cf)
 
 		causal_info = {
-			'causal_scores': causal_scores,
-			'edge_weight': edge_weight,
-			'cf_weight': cf_weight,
-			'cf_score': cf_score
+			'causal_scores': causal_scores, 'causal_logits': causal_logits,
+			'edge_weight': edge_weight, 'cf_weight': cf_weight, 'cf_score': cf_score
 		}
-
 		return score, cor, causal_info

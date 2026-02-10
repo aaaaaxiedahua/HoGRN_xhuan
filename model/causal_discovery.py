@@ -99,13 +99,12 @@ class CausalDiscovery(nn.Module):
             rel_prior = self.rel_causal_prior[edge_type].unsqueeze(-1)
             edge_logits = edge_logits + rel_prior
 
-        # 使用 Clamp 替代 Sigmoid，避免梯度饱和
-        # Sigmoid 问题：当分数接近 0 或 1 时，梯度趋近 0
-        # Clamp 优点：在 (-1, 1) 区间内梯度恒为 1
-        # 映射：clamp(x, -1, 1) * 0.5 + 0.5 -> [0, 1]
-        causal_score = torch.clamp(edge_logits, -1, 1) * 0.5 + 0.5
+        # 返回 logits 和 scores
+        # scores 用 sigmoid 映射到 [0,1]，供 edge_weight 使用
+        # logits 直接传给 CausalLoss 做均衡损失（绕过 sigmoid 饱和区）
+        causal_score = torch.sigmoid(edge_logits)
 
-        return causal_score.unsqueeze(-1) if causal_score.dim() == 1 else causal_score
+        return causal_score, edge_logits
 
     def get_stats(self, causal_score):
         """获取因果分数统计信息"""

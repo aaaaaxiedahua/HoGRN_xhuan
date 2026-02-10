@@ -51,38 +51,35 @@ class CausalLoss(nn.Module):
         progress = self.current_epoch / self.warmup_epochs
         return progress * progress  # 平方曲线，开始慢后面快
 
-    def separation_loss(self, causal_scores):
+    def logit_regularization(self, logits):
         """
-        均衡损失（移除了熵损失）
+        Logit 空间的均衡损失（绕过 sigmoid 饱和区）
 
-        原问题：熵损失导致分数快速极化到 0/1，sigmoid 饱和，梯度消失
-
-        新设计：只保留均衡损失
-        - 确保分数均值接近 0.5，防止单边坍塌
-        - 让对比损失自然地区分边的重要性
-        - 不强制极化，保持梯度流动
+        核心思想：
+        - 之前的均衡损失作用于 scores（sigmoid 之后），饱和时梯度为 0
+        - 现在直接作用于 logits（sigmoid 之前），梯度恒定
+        - logits 均值→0 等价于 scores 均值→0.5
 
         Args:
-            causal_scores: 因果分数 [num_edges, 1]
+            logits: 因果 logits [num_edges, 1]（sigmoid 之前）
 
         Returns:
-            loss: 均衡损失
+            loss: logit 均衡损失
         """
-        scores = causal_scores.squeeze()
+        logits_flat = logits.squeeze()
 
-        # 均衡损失：均值应该接近 0.5
-        mean_score = scores.mean()
-        balance_loss = (mean_score - 0.5) ** 2
+        # 均衡损失：logits 均值接近 0 → scores 均值接近 0.5
+        # 梯度直接传到 edge_scorer，不经过 sigmoid
+        mean_logit = logits_flat.mean()
+        balance_loss = mean_logit ** 2
 
-        # 可选：方差损失，鼓励分数有一定的区分度（不是全都在 0.5）
-        # 目标方差约 0.1，太小说明没区分度，太大说明极化
-        var_score = scores.var()
-        target_var = 0.1
-        var_loss = (var_score - target_var) ** 2
+        # 方差损失：鼓励 logits 有一定方差（有区分度）
+        # logits 方差太小 = 所有边分数一样，没区分度
+        var_logit = logits_flat.var()
+        target_var = 1.0  # logits 空间的目标方差
+        var_loss = (var_logit - target_var) ** 2
 
-        # 均衡损失为主，方差损失为辅
         total = balance_loss + 0.1 * var_loss
-
         return total
 
     def contrastive_loss(self, original_loss, counterfactual_loss):
@@ -115,16 +112,15 @@ class CausalLoss(nn.Module):
         loss = F.softplus(diff)
         return loss
 
-    def forward(self, causal_scores, original_loss, counterfactual_loss):
+    def forward(self, causal_scores, original_loss, counterfactual_loss, logits=None):
         """
         计算因果损失
 
-        新接口：直接接收原始损失和反事实损失（标量）
-
         Args:
-            causal_scores: 因果分数 [num_edges, 1]
+            causal_scores: 因果分数 [num_edges, 1]（sigmoid 之后）
             original_loss: 原始预测损失（标量）
             counterfactual_loss: 反事实预测损失（标量）
+            logits: 因果 logits [num_edges, 1]（sigmoid 之前，用于均衡损失）
 
         Returns:
             total_loss: 总损失
@@ -133,23 +129,26 @@ class CausalLoss(nn.Module):
         warmup = self.get_warmup_factor()
         device = causal_scores.device
 
-        # 分离损失（辅助）
-        sep_loss = self.separation_loss(causal_scores)
+        # 均衡损失：直接作用于 logits，绕过 sigmoid 饱和区
+        if logits is not None:
+            reg_loss = self.logit_regularization(logits)
+        else:
+            reg_loss = torch.tensor(0.0, device=device)
 
-        # 对比损失（核心）
+        # 对比损失（核心，通过 GCN 反传）
         contrast_loss = self.contrastive_loss(original_loss, counterfactual_loss)
 
         # 总损失
-        # 对比损失是核心，分离损失只是辅助
-        total_loss = warmup * (self.alpha * contrast_loss + self.gamma * sep_loss)
+        total_loss = warmup * self.alpha * contrast_loss + self.gamma * reg_loss
 
         # 详细统计
         scores = causal_scores.squeeze()
+        logits_flat = logits.squeeze() if logits is not None else scores
 
         loss_dict = {
             'causal_total': total_loss.item(),
             'contrastive_loss': contrast_loss.item(),
-            'separation_loss': sep_loss.item(),
+            'reg_loss': reg_loss.item(),
             'original_loss': original_loss.item() if isinstance(original_loss, torch.Tensor) else original_loss,
             'cf_loss': counterfactual_loss.item() if isinstance(counterfactual_loss, torch.Tensor) else counterfactual_loss,
             'loss_diff': (original_loss - counterfactual_loss).item() if isinstance(original_loss, torch.Tensor) else 0,
@@ -160,9 +159,10 @@ class CausalLoss(nn.Module):
             'cs_min': scores.min().item(),
             'cs_max': scores.max().item(),
             'cs_median': scores.median().item(),
+            # logits 统计
+            'logit_mean': logits_flat.mean().item(),
+            'logit_std': logits_flat.std().item(),
             # 分布统计
-            'cs_q25': scores.quantile(0.25).item(),
-            'cs_q75': scores.quantile(0.75).item(),
             'cs_below_0.3': (scores < 0.3).float().mean().item(),
             'cs_above_0.7': (scores > 0.7).float().mean().item(),
             'cs_mid_range': ((scores >= 0.3) & (scores <= 0.7)).float().mean().item(),

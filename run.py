@@ -317,7 +317,7 @@ class Runner(object):
 		# 记录因果损失信息
 		if getattr(self.p, 'use_causal', False) and len(causal_losses) > 0:
 			avg_contrast = np.mean([d.get('contrastive_loss', 0) for d in causal_losses])
-			avg_sep = np.mean([d.get('separation_loss', 0) for d in causal_losses])
+			avg_reg = np.mean([d.get('reg_loss', 0) for d in causal_losses])
 			avg_orig_loss = np.mean([d.get('original_loss', 0) for d in causal_losses])
 			avg_cf_loss = np.mean([d.get('cf_loss', 0) for d in causal_losses])
 			avg_loss_diff = np.mean([d.get('loss_diff', 0) for d in causal_losses])
@@ -332,12 +332,18 @@ class Runner(object):
 			avg_cs_above = np.mean([d.get('cs_above_0.7', 0) for d in causal_losses])
 			avg_cs_mid = np.mean([d.get('cs_mid_range', 0) for d in causal_losses])
 
-			self.logger.info('[Epoch:{}]:  Loss:{:.4}, Contrast:{:.4}, Sep:{:.4}'.format(
-				epoch, loss, avg_contrast, avg_sep))
+			# Logit 统计
+			avg_logit_mean = np.mean([d.get('logit_mean', 0) for d in causal_losses])
+			avg_logit_std = np.mean([d.get('logit_std', 0) for d in causal_losses])
+
+			self.logger.info('[Epoch:{}]:  Loss:{:.4}, Contrast:{:.4}, Reg:{:.4}'.format(
+				epoch, loss, avg_contrast, avg_reg))
 			self.logger.info('[Epoch:{}]:  Orig:{:.4}, CF:{:.4}, Diff:{:.4}, Warmup:{:.2f}'.format(
 				epoch, avg_orig_loss, avg_cf_loss, avg_loss_diff, avg_warmup))
 			self.logger.info('[Epoch:{}]:  CS: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}'.format(
 				epoch, avg_cs_mean, avg_cs_std, avg_cs_min, avg_cs_max))
+			self.logger.info('[Epoch:{}]:  Logits: mean={:.4f}, std={:.4f}'.format(
+				epoch, avg_logit_mean, avg_logit_std))
 			self.logger.info('[Epoch:{}]:  CS Distribution: <0.3={:.1%}, 0.3-0.7={:.1%}, >0.7={:.1%}\n'.format(
 				epoch, avg_cs_below, avg_cs_mid, avg_cs_above))
 
@@ -465,7 +471,7 @@ if __name__ == '__main__':
 	parser.add_argument('-causal_scale',    dest='causal_scale',    default=0.7,   type=float, help='Scale for causal score in edge weight')
 	parser.add_argument('-causal_hidden',   dest='causal_hidden',   default=100,   type=int,   help='Hidden dim for causal discovery')
 	parser.add_argument('-causal_warmup',   dest='causal_warmup',   default=15,    type=int,   help='Warmup epochs for causal loss')
-	parser.add_argument('-causal_lr',       dest='causal_lr',       default=0.1,   type=float, help='Learning rate for causal discovery module (100x main lr)')
+	parser.add_argument('-causal_lr',       dest='causal_lr',       default=0.001, type=float, help='Learning rate for causal discovery module')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')

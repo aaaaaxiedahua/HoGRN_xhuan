@@ -1,7 +1,7 @@
 {
   "_comment": "Causal-HoGRN for NELL23K with ConvE scorer",
-  "_description": "A+C + 高学习率：Clamp + 均衡损失 + causal_lr=0.1",
-  "_design": "因果模块学习率100倍，解决梯度路径长导致信号衰减",
+  "_description": "Logit-space regularization: sigmoid + logit均衡损失 + 正常学习率",
+  "_design": "辅助损失直接作用于logits（sigmoid前），绕过饱和区，提供直接梯度",
   "data": "NELL23K",
   "score_func": "conve",
   "batch": 256,
@@ -24,5 +24,5 @@
   "causal_scale": 0.7,
   "causal_hidden": 100,
   "causal_warmup": 5,
-  "causal_lr": 0.1
+  "causal_lr": 0.001
 }
