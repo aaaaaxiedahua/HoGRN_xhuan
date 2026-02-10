@@ -44,11 +44,10 @@ class HoGRNBase(BaseModel):
 		# ========== 因果结构学习模块 ==========
 		self.use_causal = getattr(self.p, 'use_causal', False)
 		if self.use_causal:
-			# 因果发现模块
-			causal_hidden = getattr(self.p, 'causal_hidden', self.p.init_dim)
+			# 因果发现模块（直接可学习 per-edge logits）
+			num_edges = edge_index.size(1)
 			self.causal_discovery = CausalDiscovery(
-				dim=self.p.init_dim,
-				hidden_dim=causal_hidden,
+				num_edges=num_edges,
 				num_rels=num_rel
 			)
 
@@ -74,55 +73,18 @@ class HoGRNBase(BaseModel):
 				target_sparsity=target_sparsity
 			)
 
-			# 预计算节点度数
-			self._precompute_degrees()
-
-	def _precompute_degrees(self):
-		"""预计算节点度数"""
-		num_edges = self.edge_index.size(1)
-		src = self.edge_index[0]
-		dst = self.edge_index[1]
-
-		# 计算出度和入度
-		self.src_degrees = torch.zeros(self.p.num_ent, device=self.device)
-		self.dst_degrees = torch.zeros(self.p.num_ent, device=self.device)
-
-		self.src_degrees.scatter_add_(0, src, torch.ones(num_edges, device=self.device))
-		self.dst_degrees.scatter_add_(0, dst, torch.ones(num_edges, device=self.device))
-
-	def _compute_causal_scores(self, edge_index, edge_type):
+	def _compute_causal_scores(self, edge_type):
 		"""
-		计算边的因果分数
+		计算边的因果分数（直接可学习 logits）
 
 		Args:
-			edge_index: 边索引 [2, num_edges]
 			edge_type: 边类型 [num_edges]
 
 		Returns:
 			causal_scores: 因果分数 [num_edges, 1]
 			causal_logits: 因果 logits [num_edges, 1]（sigmoid 之前）
 		"""
-		src, dst = edge_index
-		h_src = self.init_embed[src]  # [num_edges, dim]
-		h_dst = self.init_embed[dst]  # [num_edges, dim]
-
-		# 获取关系嵌入
-		r = self.init_rel if self.p.score_func != 'transe' else torch.cat([self.init_rel, -self.init_rel], dim=0)
-		r_edge = r[edge_type]  # [num_edges, dim]
-
-		# 获取度数特征
-		src_deg = self.src_degrees[src]
-		dst_deg = self.dst_degrees[dst]
-
-		# 计算因果分数（返回 scores 和 logits）
-		causal_scores, causal_logits = self.causal_discovery(
-			h_src, h_dst, r_edge,
-			edge_type=edge_type,
-			src_deg=src_deg,
-			dst_deg=dst_deg
-		)
-
-		return causal_scores, causal_logits
+		return self.causal_discovery(edge_type=edge_type)
 
 	def _edge_sampling(self, edge_index, edge_type, rate=0.5):
 		n_edges = edge_index.shape[1]
@@ -243,7 +205,7 @@ class HoGRN_TransE(HoGRNBase):
 		z = None
 
 		if self.use_causal:
-			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
+			causal_scores, causal_logits = self._compute_causal_scores(self.edge_type)
 			edge_weight, z = self.gumbel_intervention(causal_logits)
 
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
@@ -270,7 +232,7 @@ class HoGRN_DistMult(HoGRNBase):
 		z = None
 
 		if self.use_causal:
-			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
+			causal_scores, causal_logits = self._compute_causal_scores(self.edge_type)
 			edge_weight, z = self.gumbel_intervention(causal_logits)
 
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
@@ -339,7 +301,7 @@ class HoGRN_ConvE(HoGRNBase):
 		z = None
 
 		if self.use_causal:
-			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
+			causal_scores, causal_logits = self._compute_causal_scores(self.edge_type)
 			edge_weight, z = self.gumbel_intervention(causal_logits)
 
 		# 前向传播（只需要 1 次，不需要反事实！）
