@@ -65,11 +65,13 @@ class HoGRNBase(BaseModel):
 			)
 
 			# 因果稀疏损失
-			causal_sparse = getattr(self.p, 'causal_sparse', 0.01)
-			warmup_epochs = getattr(self.p, 'causal_warmup', 5)
+			causal_sparse = getattr(self.p, 'causal_sparse', 0.0001)
+			warmup_epochs = getattr(self.p, 'causal_warmup', 30)
+			target_sparsity = getattr(self.p, 'causal_target', 0.5)
 			self.sparsity_loss = CausalSparsityLoss(
 				lambda_sparse=causal_sparse,
-				warmup_epochs=warmup_epochs
+				warmup_epochs=warmup_epochs,
+				target_sparsity=target_sparsity
 			)
 
 			# 预计算节点度数

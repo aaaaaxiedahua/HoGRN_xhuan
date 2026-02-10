@@ -18,23 +18,26 @@ import torch.nn as nn
 
 class CausalSparsityLoss(nn.Module):
     """
-    因果稀疏损失
+    因果稀疏损失（目标稀疏率版）
 
     设计原则：
-    - L1 稀疏惩罚推低所有边的因果分数
+    - 目标稀疏率惩罚：当 mean(scores) > target 时才产生惩罚
+    - 低于 target 时惩罚为 0，避免分数崩溃到 0
     - 主预测损失推高重要边的分数（通过 Gumbel-Softmax）
-    - 两者对抗找到平衡 → 发现最小因果子图
+    - 分数在 target 附近稳定，不同边根据主损失梯度分化出高低
     """
 
-    def __init__(self, lambda_sparse=0.01, warmup_epochs=5):
+    def __init__(self, lambda_sparse=0.0001, warmup_epochs=30, target_sparsity=0.5):
         """
         Args:
             lambda_sparse: 稀疏惩罚权重
             warmup_epochs: warmup 轮数（稀疏惩罚逐渐加强）
+            target_sparsity: 目标保留率，mean(scores) 低于此值时不惩罚
         """
         super().__init__()
         self.lambda_sparse = lambda_sparse
         self.warmup_epochs = warmup_epochs
+        self.target_sparsity = target_sparsity
         self.current_epoch = 0
 
     def set_epoch(self, epoch):
@@ -62,8 +65,9 @@ class CausalSparsityLoss(nn.Module):
         warmup = self.get_warmup_factor()
         scores = causal_scores.squeeze()
 
-        # L1 稀疏惩罚：推动分数趋向 0
-        sparse_loss = scores.mean()
+        # 目标稀疏率惩罚：只在 mean > target 时产生惩罚
+        excess = (scores.mean() - self.target_sparsity).clamp(min=0)
+        sparse_loss = excess ** 2
 
         total = warmup * self.lambda_sparse * sparse_loss
 
