@@ -65,9 +65,8 @@ class CausalSparsityLoss(nn.Module):
         warmup = self.get_warmup_factor()
         scores = causal_scores.squeeze()
 
-        # 目标稀疏率惩罚：只在 mean > target 时产生惩罚
-        excess = (scores.mean() - self.target_sparsity).clamp(min=0)
-        sparse_loss = excess ** 2
+        # 双侧目标稀疏率：mean 偏离 target 任一方向都产生惩罚
+        sparse_loss = (scores.mean() - self.target_sparsity) ** 2
 
         total = warmup * self.lambda_sparse * sparse_loss
 
