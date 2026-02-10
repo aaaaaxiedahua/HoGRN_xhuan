@@ -1,7 +1,7 @@
 {
   "_comment": "Causal-HoGRN for NELL23K with ConvE scorer",
-  "_description": "A+C: Clamp替代Sigmoid + 移除熵损失只保留均衡损失",
-  "_design": "Clamp避免梯度饱和，对比损失自然区分边重要性",
+  "_description": "A+C + 高学习率：Clamp + 均衡损失 + causal_lr=0.1",
+  "_design": "因果模块学习率100倍，解决梯度路径长导致信号衰减",
   "data": "NELL23K",
   "score_func": "conve",
   "batch": 256,
@@ -23,5 +23,6 @@
   "causal_base": 0.3,
   "causal_scale": 0.7,
   "causal_hidden": 100,
-  "causal_warmup": 5
+  "causal_warmup": 5,
+  "causal_lr": 0.1
 }

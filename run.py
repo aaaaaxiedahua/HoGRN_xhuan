@@ -151,7 +151,17 @@ class Runner(object):
 	def add_optimizer(self, parameters):
 		"""
 		Create an optimizer for training the parameters
+		因果发现模块使用更高的学习率（梯度路径长，信号衰减严重）
 		"""
+		if getattr(self.p, 'use_causal', False):
+			causal_lr = getattr(self.p, 'causal_lr', self.p.lr * 100)
+			main_params = [p for n, p in self.model.named_parameters() if 'causal_discovery' not in n]
+			causal_params = [p for n, p in self.model.named_parameters() if 'causal_discovery' in n]
+			print(f"Causal LR: {causal_lr}, Main LR: {self.p.lr}, Causal params: {sum(p.numel() for p in causal_params)}")
+			return torch.optim.Adam([
+				{'params': main_params, 'lr': self.p.lr},
+				{'params': causal_params, 'lr': causal_lr}
+			], weight_decay=self.p.l2)
 		return torch.optim.Adam(parameters, lr=self.p.lr, weight_decay=self.p.l2)
 
 	def read_batch(self, batch, split):
@@ -455,6 +465,7 @@ if __name__ == '__main__':
 	parser.add_argument('-causal_scale',    dest='causal_scale',    default=0.7,   type=float, help='Scale for causal score in edge weight')
 	parser.add_argument('-causal_hidden',   dest='causal_hidden',   default=100,   type=int,   help='Hidden dim for causal discovery')
 	parser.add_argument('-causal_warmup',   dest='causal_warmup',   default=15,    type=int,   help='Warmup epochs for causal loss')
+	parser.add_argument('-causal_lr',       dest='causal_lr',       default=0.1,   type=float, help='Learning rate for causal discovery module (100x main lr)')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')
