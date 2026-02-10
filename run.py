@@ -151,10 +151,10 @@ class Runner(object):
 	def add_optimizer(self, parameters):
 		"""
 		Create an optimizer for training the parameters
-		因果发现模块使用更高的学习率（梯度路径长，信号衰减严重）
+		因果发现模块可使用独立学习率
 		"""
 		if getattr(self.p, 'use_causal', False):
-			causal_lr = getattr(self.p, 'causal_lr', self.p.lr * 100)
+			causal_lr = getattr(self.p, 'causal_lr', self.p.lr)
 			main_params = [p for n, p in self.model.named_parameters() if 'causal_discovery' not in n]
 			causal_params = [p for n, p in self.model.named_parameters() if 'causal_discovery' in n]
 			print(f"Causal LR: {causal_lr}, Main LR: {self.p.lr}, Causal params: {sum(p.numel() for p in causal_params)}")
@@ -266,6 +266,14 @@ class Runner(object):
 		causal_losses = []
 		train_iter = iter(self.data_iter['train'])
 
+		# Temperature 退火（Gumbel-Softmax）
+		if getattr(self.p, 'use_causal', False):
+			temp_init = getattr(self.p, 'causal_temp_init', 1.0)
+			temp_min = getattr(self.p, 'causal_temp_min', 0.1)
+			temp_anneal = getattr(self.p, 'causal_temp_anneal', 0.005)
+			temperature = max(temp_min, temp_init - epoch * temp_anneal)
+			self.model.gumbel_intervention.set_temperature(temperature)
+
 		for step, batch in enumerate(train_iter):
 			self.optimizer.zero_grad()
 			sub, rel, obj, label = self.read_batch(batch, 'train')
@@ -276,30 +284,17 @@ class Runner(object):
 			if self.p.sim_decay > 0:
 				loss += self.p.sim_decay * cor
 
-			# 添加因果损失（对比学习版）
+			# 因果稀疏损失（Gumbel-Softmax 版）
 			if getattr(self.p, 'use_causal', False):
-				# 设置当前 epoch（用于 warmup）
-				self.model.causal_loss.set_epoch(epoch)
-
-				# 计算因果损失
-				cf_score = causal_info.get('cf_score')
-				if cf_score is not None:
-					# 计算反事实损失（BCE）
-					cf_loss = self.model.loss(cf_score, label)
-
-					# 对比因果损失：原始损失应该小于反事实损失
-					# 新接口：直接传入两个损失值
-					causal_loss, causal_loss_dict = self.model.compute_causal_loss(
-						causal_info, loss, cf_loss  # 传入 loss 而非 pred
-					)
-					loss = loss + causal_loss  # 使用 = 而非 +=，确保计算图正确
-					causal_losses.append(causal_loss_dict)
+				self.model.sparsity_loss.set_epoch(epoch)
+				causal_loss, causal_loss_dict = self.model.compute_causal_loss(causal_info)
+				loss = loss + causal_loss
+				causal_losses.append(causal_loss_dict)
 
 			loss.backward()
 
 			# 每 50 个 step 检查一次梯度
 			if step % 50 == 0 and getattr(self.p, 'use_causal', False):
-				# 检查因果发现模块的梯度
 				grad_info = []
 				for name, param in self.model.causal_discovery.named_parameters():
 					if param.grad is not None:
@@ -307,7 +302,7 @@ class Runner(object):
 						grad_info.append(f"{name}:{grad_norm:.6f}")
 				if grad_info and epoch % 5 == 0:
 					self.logger.info('[Epoch:{} Step:{}] Causal Grads: {}'.format(
-						epoch, step, ', '.join(grad_info[:4])))  # 只显示前4个
+						epoch, step, ', '.join(grad_info[:4])))
 
 			self.optimizer.step()
 			losses.append(loss.item())
@@ -316,12 +311,9 @@ class Runner(object):
 
 		# 记录因果损失信息
 		if getattr(self.p, 'use_causal', False) and len(causal_losses) > 0:
-			avg_contrast = np.mean([d.get('contrastive_loss', 0) for d in causal_losses])
-			avg_reg = np.mean([d.get('reg_loss', 0) for d in causal_losses])
-			avg_orig_loss = np.mean([d.get('original_loss', 0) for d in causal_losses])
-			avg_cf_loss = np.mean([d.get('cf_loss', 0) for d in causal_losses])
-			avg_loss_diff = np.mean([d.get('loss_diff', 0) for d in causal_losses])
+			avg_sparse = np.mean([d.get('sparse_loss', 0) for d in causal_losses])
 			avg_warmup = np.mean([d.get('warmup', 0) for d in causal_losses])
+			avg_temp = np.mean([d.get('temperature', 0) for d in causal_losses])
 
 			# 因果分数统计
 			avg_cs_mean = np.mean([d.get('cs_mean', 0) for d in causal_losses])
@@ -336,10 +328,8 @@ class Runner(object):
 			avg_logit_mean = np.mean([d.get('logit_mean', 0) for d in causal_losses])
 			avg_logit_std = np.mean([d.get('logit_std', 0) for d in causal_losses])
 
-			self.logger.info('[Epoch:{}]:  Loss:{:.4}, Contrast:{:.4}, Reg:{:.4}'.format(
-				epoch, loss, avg_contrast, avg_reg))
-			self.logger.info('[Epoch:{}]:  Orig:{:.4}, CF:{:.4}, Diff:{:.4}, Warmup:{:.2f}'.format(
-				epoch, avg_orig_loss, avg_cf_loss, avg_loss_diff, avg_warmup))
+			self.logger.info('[Epoch:{}]:  Loss:{:.4}, Sparse:{:.4}, Temp:{:.3f}, Warmup:{:.2f}'.format(
+				epoch, loss, avg_sparse, avg_temp, avg_warmup))
 			self.logger.info('[Epoch:{}]:  CS: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}'.format(
 				epoch, avg_cs_mean, avg_cs_std, avg_cs_min, avg_cs_max))
 			self.logger.info('[Epoch:{}]:  Logits: mean={:.4f}, std={:.4f}'.format(
@@ -349,16 +339,15 @@ class Runner(object):
 
 			# 每 5 个 epoch 记录更详细的统计
 			if epoch % 5 == 0:
-				# Edge weight 统计
 				avg_ew_mean = np.mean([d.get('ew_mean', 0) for d in causal_losses])
 				avg_ew_std = np.mean([d.get('ew_std', 0) for d in causal_losses])
-				avg_ew_min = np.mean([d.get('ew_min', 0) for d in causal_losses])
-				avg_ew_max = np.mean([d.get('ew_max', 0) for d in causal_losses])
-				avg_cw_mean = np.mean([d.get('cw_mean', 0) for d in causal_losses])
+				avg_z_mean = np.mean([d.get('z_mean', 0) for d in causal_losses])
+				avg_z_std = np.mean([d.get('z_std', 0) for d in causal_losses])
 
-				self.logger.info('[Epoch:{}]:  EdgeWeight: mean={:.4f}, std={:.4f}, min={:.4f}, max={:.4f}'.format(
-					epoch, avg_ew_mean, avg_ew_std, avg_ew_min, avg_ew_max))
-				self.logger.info('[Epoch:{}]:  CF_Weight: mean={:.4f}'.format(epoch, avg_cw_mean))
+				self.logger.info('[Epoch:{}]:  EdgeWeight: mean={:.4f}, std={:.4f}'.format(
+					epoch, avg_ew_mean, avg_ew_std))
+				self.logger.info('[Epoch:{}]:  Z (sampled): mean={:.4f}, std={:.4f}'.format(
+					epoch, avg_z_mean, avg_z_std))
 
 				if causal_info.get('causal_scores') is not None:
 					causal_stats = self.model.causal_discovery.get_stats(causal_info['causal_scores'])
@@ -461,17 +450,17 @@ if __name__ == '__main__':
 	parser.add_argument('-sim_decay',	dest='sim_decay',	default=0,		type=float, help='Regularization weight for independence modeling')
 	parser.add_argument('-rel_drop',  	dest='rel_drop', 	default=0,  	type=float,	help='Dropout for generate positive relation')
 
-	# Causal Structure Learning parameters
-	parser.add_argument('-use_causal',      dest='use_causal',      action='store_true',    help='Enable Causal Structure Learning')
-	parser.add_argument('-causal_alpha',    dest='causal_alpha',    default=0.5,   type=float, help='Weight for contrastive loss (core)')
-	parser.add_argument('-causal_beta',     dest='causal_beta',     default=0.1,   type=float, help='Reserved for compatibility')
-	parser.add_argument('-causal_gamma',    dest='causal_gamma',    default=0.0001,type=float, help='Weight for separation loss (auxiliary)')
-	parser.add_argument('-causal_margin',   dest='causal_margin',   default=0.1,   type=float, help='Margin for contrastive loss')
-	parser.add_argument('-causal_base',     dest='causal_base',     default=0.3,   type=float, help='Base weight for residual connection')
-	parser.add_argument('-causal_scale',    dest='causal_scale',    default=0.7,   type=float, help='Scale for causal score in edge weight')
-	parser.add_argument('-causal_hidden',   dest='causal_hidden',   default=100,   type=int,   help='Hidden dim for causal discovery')
-	parser.add_argument('-causal_warmup',   dest='causal_warmup',   default=15,    type=int,   help='Warmup epochs for causal loss')
-	parser.add_argument('-causal_lr',       dest='causal_lr',       default=0.001, type=float, help='Learning rate for causal discovery module')
+	# Causal Structure Learning parameters (Gumbel-Softmax edge intervention)
+	parser.add_argument('-use_causal',          dest='use_causal',          action='store_true',    help='Enable Causal Structure Learning')
+	parser.add_argument('-causal_sparse',       dest='causal_sparse',       default=0.01,  type=float, help='Weight for sparsity loss')
+	parser.add_argument('-causal_base',         dest='causal_base',         default=0.3,   type=float, help='Base weight for residual connection')
+	parser.add_argument('-causal_scale',        dest='causal_scale',        default=0.7,   type=float, help='Scale for edge weight')
+	parser.add_argument('-causal_hidden',       dest='causal_hidden',       default=100,   type=int,   help='Hidden dim for causal discovery')
+	parser.add_argument('-causal_warmup',       dest='causal_warmup',       default=5,     type=int,   help='Warmup epochs for sparsity loss')
+	parser.add_argument('-causal_temp_init',    dest='causal_temp_init',    default=1.0,   type=float, help='Initial temperature for Gumbel-Softmax')
+	parser.add_argument('-causal_temp_min',     dest='causal_temp_min',     default=0.1,   type=float, help='Minimum temperature for Gumbel-Softmax')
+	parser.add_argument('-causal_temp_anneal',  dest='causal_temp_anneal',  default=0.005, type=float, help='Temperature decay per epoch')
+	parser.add_argument('-causal_lr',           dest='causal_lr',           default=0.001, type=float, help='Learning rate for causal discovery module')
 
 	# ConvE specific hyperparameters
 	parser.add_argument('-hid_drop2',  	dest='hid_drop2', 	default=0.3,  	type=float,	help='ConvE: Hidden dropout')

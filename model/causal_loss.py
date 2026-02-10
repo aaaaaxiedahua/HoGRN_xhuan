@@ -1,41 +1,39 @@
 """
-因果损失模块 (Causal Loss Module) - 对比学习版
+因果稀疏损失模块 (Causal Sparsity Loss)
 
 核心思想：
-- 残差连接保证最小信息流：edge_weight = 0.3 + 0.7 * causal_score
-- 对比损失：原始预测应该比反事实预测好
-- 分离损失（辅助）：轻微鼓励因果分数极化
-- 两种力量平衡：对比损失推高重要边分数，分离损失推向极端
+- 稀疏惩罚：鼓励模型只保留少数真正因果重要的边
+- 信息瓶颈原理：迫使模型从最少的边中提取最多的预测信息
+- 主预测损失通过 Gumbel-Softmax 直接训练边重要性
+
+两种力量的平衡：
+- 主预测损失（通过 Gumbel-Softmax 反传）：推高重要边的分数
+- 稀疏惩罚：推低所有边的分数
+- 对抗结果：只有真正因果重要的边保持高分数
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
-class CausalLoss(nn.Module):
+class CausalSparsityLoss(nn.Module):
     """
-    对比因果损失
+    因果稀疏损失
 
-    核心设计：
-    1. 对比损失：原始损失应该小于反事实损失（重要边被保留时预测更好）
-    2. 分离损失（辅助）：轻微鼓励极化，避免所有分数都在 0.5
-    3. Warmup：让模型先学会基本预测，再学因果结构
+    设计原则：
+    - L1 稀疏惩罚推低所有边的因果分数
+    - 主预测损失推高重要边的分数（通过 Gumbel-Softmax）
+    - 两者对抗找到平衡 → 发现最小因果子图
     """
 
-    def __init__(self, alpha=0.5, beta=0.1, gamma=0.0001, margin=0.1, warmup_epochs=10):
+    def __init__(self, lambda_sparse=0.01, warmup_epochs=5):
         """
         Args:
-            alpha: 对比损失权重（核心损失）
-            beta: 未使用，保留兼容性
-            gamma: 分离损失权重（应该很小，只起辅助作用）
-            margin: 对比损失的 margin（原始损失应该比反事实损失小 margin）
-            warmup_epochs: warmup 轮数
+            lambda_sparse: 稀疏惩罚权重
+            warmup_epochs: warmup 轮数（稀疏惩罚逐渐加强）
         """
         super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.margin = margin
+        self.lambda_sparse = lambda_sparse
         self.warmup_epochs = warmup_epochs
         self.current_epoch = 0
 
@@ -47,111 +45,34 @@ class CausalLoss(nn.Module):
         """获取 warmup 系数"""
         if self.current_epoch >= self.warmup_epochs:
             return 1.0
-        # 使用更平滑的 warmup 曲线
-        progress = self.current_epoch / self.warmup_epochs
-        return progress * progress  # 平方曲线，开始慢后面快
+        return self.current_epoch / self.warmup_epochs
 
-    def logit_regularization(self, logits):
+    def forward(self, causal_scores, logits=None):
         """
-        Logit 空间的均衡损失（绕过 sigmoid 饱和区）
-
-        核心思想：
-        - 之前的均衡损失作用于 scores（sigmoid 之后），饱和时梯度为 0
-        - 现在直接作用于 logits（sigmoid 之前），梯度恒定
-        - logits 均值→0 等价于 scores 均值→0.5
+        计算稀疏损失
 
         Args:
-            logits: 因果 logits [num_edges, 1]（sigmoid 之前）
+            causal_scores: sigmoid(logits) [num_edges, 1]，因果分数
+            logits: 原始 logits [num_edges, 1]（用于统计）
 
         Returns:
-            loss: logit 均衡损失
-        """
-        logits_flat = logits.squeeze()
-
-        # 均衡损失：logits 均值接近 0 → scores 均值接近 0.5
-        # 梯度直接传到 edge_scorer，不经过 sigmoid
-        mean_logit = logits_flat.mean()
-        balance_loss = mean_logit ** 2
-
-        # 方差损失：鼓励 logits 有一定方差（有区分度）
-        # logits 方差太小 = 所有边分数一样，没区分度
-        var_logit = logits_flat.var()
-        target_var = 1.0  # logits 空间的目标方差
-        var_loss = (var_logit - target_var) ** 2
-
-        total = balance_loss + 0.1 * var_loss
-        return total
-
-    def contrastive_loss(self, original_loss, counterfactual_loss):
-        """
-        对比损失：原始预测应该比反事实好
-
-        核心原理：
-        - 原始预测使用权重 = 0.3 + 0.7 * causal_score（高因果边权重高）
-        - 反事实预测使用权重 = 1.0 - 0.7 * causal_score（高因果边权重低）
-        - 如果因果分数正确，原始预测应该更好（损失更小）
-
-        使用 Softplus 替代 ReLU：
-        - ReLU 的问题：当 orig < cf 时梯度为 0，因果分数无法学习
-        - Softplus 始终有非零梯度，即使 orig < cf 也能传递信号
-        - loss = log(1 + exp(orig - cf + margin))
-        - 当 orig << cf 时，loss ≈ 0（但仍有小梯度）
-        - 当 orig >> cf 时，loss ≈ orig - cf + margin
-
-        这样即使模型正确（orig < cf），也有轻微梯度继续优化因果分数
-
-        Args:
-            original_loss: 原始预测损失（标量）
-            counterfactual_loss: 反事实预测损失（标量）
-
-        Returns:
-            loss: 对比损失
-        """
-        # Softplus: 始终有梯度，避免因果分数学习停滞
-        diff = original_loss - counterfactual_loss + self.margin
-        loss = F.softplus(diff)
-        return loss
-
-    def forward(self, causal_scores, original_loss, counterfactual_loss, logits=None):
-        """
-        计算因果损失
-
-        Args:
-            causal_scores: 因果分数 [num_edges, 1]（sigmoid 之后）
-            original_loss: 原始预测损失（标量）
-            counterfactual_loss: 反事实预测损失（标量）
-            logits: 因果 logits [num_edges, 1]（sigmoid 之前，用于均衡损失）
-
-        Returns:
-            total_loss: 总损失
-            loss_dict: 各项损失详情
+            loss: 稀疏损失
+            loss_dict: 统计信息
         """
         warmup = self.get_warmup_factor()
-        device = causal_scores.device
-
-        # 均衡损失：直接作用于 logits，绕过 sigmoid 饱和区
-        if logits is not None:
-            reg_loss = self.logit_regularization(logits)
-        else:
-            reg_loss = torch.tensor(0.0, device=device)
-
-        # 对比损失（核心，通过 GCN 反传）
-        contrast_loss = self.contrastive_loss(original_loss, counterfactual_loss)
-
-        # 总损失
-        total_loss = warmup * self.alpha * contrast_loss + self.gamma * reg_loss
-
-        # 详细统计
         scores = causal_scores.squeeze()
+
+        # L1 稀疏惩罚：推动分数趋向 0
+        sparse_loss = scores.mean()
+
+        total = warmup * self.lambda_sparse * sparse_loss
+
+        # 统计信息
         logits_flat = logits.squeeze() if logits is not None else scores
 
         loss_dict = {
-            'causal_total': total_loss.item(),
-            'contrastive_loss': contrast_loss.item(),
-            'reg_loss': reg_loss.item(),
-            'original_loss': original_loss.item() if isinstance(original_loss, torch.Tensor) else original_loss,
-            'cf_loss': counterfactual_loss.item() if isinstance(counterfactual_loss, torch.Tensor) else counterfactual_loss,
-            'loss_diff': (original_loss - counterfactual_loss).item() if isinstance(original_loss, torch.Tensor) else 0,
+            'causal_total': total.item(),
+            'sparse_loss': sparse_loss.item(),
             'warmup': warmup,
             # 因果分数统计
             'cs_mean': scores.mean().item(),
@@ -168,62 +89,4 @@ class CausalLoss(nn.Module):
             'cs_mid_range': ((scores >= 0.3) & (scores <= 0.7)).float().mean().item(),
         }
 
-        return total_loss, loss_dict
-
-
-class ContrastiveCausalLoss(nn.Module):
-    """
-    对比因果损失
-
-    更直接的设计：
-    1. 原始预测损失
-    2. 反事实预测损失
-    3. 约束：原始损失 < 反事实损失
-    """
-
-    def __init__(self, gamma=0.01, margin=0.1, warmup_epochs=10):
-        super().__init__()
-        self.gamma = gamma
-        self.margin = margin
-        self.warmup_epochs = warmup_epochs
-        self.current_epoch = 0
-
-    def set_epoch(self, epoch):
-        self.current_epoch = epoch
-
-    def get_warmup_factor(self):
-        if self.current_epoch >= self.warmup_epochs:
-            return 1.0
-        return self.current_epoch / self.warmup_epochs
-
-    def forward(self, causal_scores, original_loss, counterfactual_loss):
-        """
-        Args:
-            causal_scores: 因果分数 [num_edges, 1]
-            original_loss: 原始预测损失（标量）
-            counterfactual_loss: 反事实预测损失（标量）
-        """
-        warmup = self.get_warmup_factor()
-        device = causal_scores.device
-
-        # 分离损失
-        eps = 1e-8
-        scores = causal_scores.squeeze()
-        entropy = -(scores * torch.log(scores + eps) +
-                    (1 - scores) * torch.log(1 - scores + eps))
-        sep_loss = entropy.mean()
-
-        # 对比损失
-        contrast_loss = F.relu(original_loss - counterfactual_loss + self.margin)
-
-        # 总损失
-        total_loss = warmup * (self.gamma * sep_loss + 0.1 * contrast_loss)
-
-        loss_dict = {
-            'causal_total': total_loss.item(),
-            'separation_loss': sep_loss.item(),
-            'contrastive_loss': contrast_loss.item(),
-            'warmup': warmup
-        }
-
-        return total_loss, loss_dict
+        return total, loss_dict

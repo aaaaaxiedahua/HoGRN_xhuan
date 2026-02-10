@@ -1,7 +1,7 @@
 {
   "_comment": "Causal-HoGRN for NELL23K with ConvE scorer",
-  "_description": "Logit-space regularization: sigmoid + logit均衡损失 + 正常学习率",
-  "_design": "辅助损失直接作用于logits（sigmoid前），绕过饱和区，提供直接梯度",
+  "_description": "Gumbel-Softmax 边级别随机干预 + 稀疏惩罚",
+  "_design": "可微的边级别干预，主损失直接训练边重要性，稀疏惩罚发现因果子图",
   "data": "NELL23K",
   "score_func": "conve",
   "batch": 256,
@@ -17,12 +17,13 @@
   "chan_drop": 0.1,
   "rel_norm": true,
   "use_causal": true,
-  "causal_alpha": 1.0,
-  "causal_gamma": 0.1,
-  "causal_margin": 0.0,
+  "causal_sparse": 0.01,
   "causal_base": 0.3,
   "causal_scale": 0.7,
   "causal_hidden": 100,
   "causal_warmup": 5,
+  "causal_temp_init": 1.0,
+  "causal_temp_min": 0.1,
+  "causal_temp_anneal": 0.005,
   "causal_lr": 0.001
 }

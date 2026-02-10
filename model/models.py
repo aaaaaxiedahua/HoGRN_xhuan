@@ -1,8 +1,8 @@
 from helper import *
 from model.hogrn_conv import HoGRNConv
 from model.causal_discovery import CausalDiscovery
-from model.intervention import SoftIntervention
-from model.causal_loss import CausalLoss
+from model.intervention import GumbelIntervention
+from model.causal_loss import CausalSparsityLoss
 
 
 class BaseModel(torch.nn.Module):
@@ -52,26 +52,23 @@ class HoGRNBase(BaseModel):
 				num_rels=num_rel
 			)
 
-			# 软干预模块（带残差连接）
-			# base_weight=0.3 保证最小信息流，scale=0.7 控制因果分数影响
+			# Gumbel-Softmax 边干预模块
 			causal_base = getattr(self.p, 'causal_base', 0.3)
 			causal_scale = getattr(self.p, 'causal_scale', 0.7)
-			self.soft_intervention = SoftIntervention(
+			temp_init = getattr(self.p, 'causal_temp_init', 1.0)
+			temp_min = getattr(self.p, 'causal_temp_min', 0.1)
+			self.gumbel_intervention = GumbelIntervention(
 				base_weight=causal_base,
-				scale=causal_scale
+				scale=causal_scale,
+				init_temperature=temp_init,
+				min_temperature=temp_min
 			)
 
-			# 因果损失（对比学习版）
-			causal_alpha = getattr(self.p, 'causal_alpha', 0.5)   # 对比损失权重
-			causal_beta = getattr(self.p, 'causal_beta', 0.1)     # 保留兼容性
-			causal_gamma = getattr(self.p, 'causal_gamma', 0.0001)  # 分离损失权重（很小）
-			causal_margin = getattr(self.p, 'causal_margin', 0.1)  # 对比损失 margin
-			warmup_epochs = getattr(self.p, 'causal_warmup', 15)
-			self.causal_loss = CausalLoss(
-				alpha=causal_alpha,
-				beta=causal_beta,
-				gamma=causal_gamma,
-				margin=causal_margin,
+			# 因果稀疏损失
+			causal_sparse = getattr(self.p, 'causal_sparse', 0.01)
+			warmup_epochs = getattr(self.p, 'causal_warmup', 5)
+			self.sparsity_loss = CausalSparsityLoss(
+				lambda_sparse=causal_sparse,
 				warmup_epochs=warmup_epochs
 			)
 
@@ -193,45 +190,43 @@ class HoGRNBase(BaseModel):
 
 		return sub_emb, rel_emb, x, cor
 
-	def compute_causal_loss(self, causal_info, original_loss, counterfactual_loss):
+	def compute_causal_loss(self, causal_info):
 		"""
-		计算因果损失（对比学习版）
+		计算因果稀疏损失
 
 		Args:
-			causal_info: 因果信息字典，包含 causal_scores 和 causal_logits
-			original_loss: 原始预测的 BCE 损失（标量）
-			counterfactual_loss: 反事实预测的 BCE 损失（标量）
+			causal_info: 因果信息字典
 
 		Returns:
-			causal_loss: 因果损失
+			sparse_loss: 稀疏损失
 			loss_dict: 损失详情
 		"""
-		if not self.use_causal or causal_info['causal_scores'] is None:
+		if not self.use_causal or causal_info.get('causal_scores') is None:
 			return torch.tensor(0.0, device=self.device), {}
 
 		causal_scores = causal_info['causal_scores']
 		causal_logits = causal_info.get('causal_logits')
 
-		# 传入 logits 用于均衡损失（绕过 sigmoid 饱和区）
-		causal_loss, loss_dict = self.causal_loss(
-			causal_scores, original_loss, counterfactual_loss, logits=causal_logits
-		)
+		sparse_loss, loss_dict = self.sparsity_loss(causal_scores, logits=causal_logits)
 
-		# 添加 edge_weight 统计
+		# edge_weight 统计
 		edge_weight = causal_info.get('edge_weight')
-		cf_weight = causal_info.get('cf_weight')
+		z = causal_info.get('z')
 		if edge_weight is not None:
 			ew = edge_weight.squeeze()
 			loss_dict['ew_mean'] = ew.mean().item()
 			loss_dict['ew_std'] = ew.std().item()
 			loss_dict['ew_min'] = ew.min().item()
 			loss_dict['ew_max'] = ew.max().item()
-		if cf_weight is not None:
-			cw = cf_weight.squeeze()
-			loss_dict['cw_mean'] = cw.mean().item()
-			loss_dict['cw_std'] = cw.std().item()
+		if z is not None:
+			zf = z.squeeze()
+			loss_dict['z_mean'] = zf.mean().item()
+			loss_dict['z_std'] = zf.std().item()
 
-		return causal_loss, loss_dict
+		# Temperature
+		loss_dict['temperature'] = self.gumbel_intervention.temperature
+
+		return sparse_loss, loss_dict
 
 
 class HoGRN_TransE(HoGRNBase):
@@ -243,28 +238,20 @@ class HoGRN_TransE(HoGRNBase):
 		causal_scores = None
 		causal_logits = None
 		edge_weight = None
-		cf_weight = None
+		z = None
 
 		if self.use_causal:
 			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
-			edge_weight = self.soft_intervention(causal_scores)
-			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
+			edge_weight, z = self.gumbel_intervention(causal_logits)
 
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
 		obj_emb	= sub_emb + rel_emb
 		x		= self.p.gamma - torch.norm(obj_emb.unsqueeze(1) - all_ent, p=1, dim=2)
 		score	= torch.sigmoid(x)
 
-		cf_score = None
-		if self.use_causal and self.training:
-			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=cf_weight)
-			obj_emb_cf = sub_emb_cf + rel_emb_cf
-			x_cf = self.p.gamma - torch.norm(obj_emb_cf.unsqueeze(1) - all_ent_cf, p=1, dim=2)
-			cf_score = torch.sigmoid(x_cf)
-
 		causal_info = {
 			'causal_scores': causal_scores, 'causal_logits': causal_logits,
-			'edge_weight': edge_weight, 'cf_weight': cf_weight, 'cf_score': cf_score
+			'edge_weight': edge_weight, 'z': z
 		}
 		return score, cor, causal_info
 
@@ -278,12 +265,11 @@ class HoGRN_DistMult(HoGRNBase):
 		causal_scores = None
 		causal_logits = None
 		edge_weight = None
-		cf_weight = None
+		z = None
 
 		if self.use_causal:
 			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
-			edge_weight = self.soft_intervention(causal_scores)
-			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
+			edge_weight, z = self.gumbel_intervention(causal_logits)
 
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=edge_weight)
 		obj_emb	= sub_emb * rel_emb
@@ -291,17 +277,9 @@ class HoGRN_DistMult(HoGRNBase):
 		x 	+= self.bias.expand_as(x)
 		score = torch.sigmoid(x)
 
-		cf_score = None
-		if self.use_causal and self.training:
-			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.drop, self.drop, edge_weight=cf_weight)
-			obj_emb_cf = sub_emb_cf * rel_emb_cf
-			x_cf = torch.mm(obj_emb_cf, all_ent_cf.transpose(1, 0))
-			x_cf += self.bias.expand_as(x_cf)
-			cf_score = torch.sigmoid(x_cf)
-
 		causal_info = {
 			'causal_scores': causal_scores, 'causal_logits': causal_logits,
-			'edge_weight': edge_weight, 'cf_weight': cf_weight, 'cf_score': cf_score
+			'edge_weight': edge_weight, 'z': z
 		}
 		return score, cor, causal_info
 
@@ -356,25 +334,18 @@ class HoGRN_ConvE(HoGRNBase):
 		causal_scores = None
 		causal_logits = None
 		edge_weight = None
-		cf_weight = None
+		z = None
 
 		if self.use_causal:
 			causal_scores, causal_logits = self._compute_causal_scores(self.edge_index, self.edge_type)
-			edge_weight = self.soft_intervention(causal_scores)
-			cf_weight = self.soft_intervention.counterfactual_weight(causal_scores)
+			edge_weight, z = self.gumbel_intervention(causal_logits)
 
-		# 原始预测
+		# 前向传播（只需要 1 次，不需要反事实！）
 		sub_emb, rel_emb, all_ent, cor = self.forward_base(sub, rel, self.hidden_drop, self.hidden_drop, edge_weight=edge_weight)
 		score = self._score_func(sub_emb, rel_emb, all_ent)
 
-		# 反事实预测
-		cf_score = None
-		if self.use_causal and self.training:
-			sub_emb_cf, rel_emb_cf, all_ent_cf, _ = self.forward_base(sub, rel, self.hidden_drop, self.hidden_drop, edge_weight=cf_weight)
-			cf_score = self._score_func(sub_emb_cf, rel_emb_cf, all_ent_cf)
-
 		causal_info = {
 			'causal_scores': causal_scores, 'causal_logits': causal_logits,
-			'edge_weight': edge_weight, 'cf_weight': cf_weight, 'cf_score': cf_score
+			'edge_weight': edge_weight, 'z': z
 		}
 		return score, cor, causal_info
